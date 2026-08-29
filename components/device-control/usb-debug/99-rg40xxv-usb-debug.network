@@ -1,0 +1,16 @@
+[Match]
+Name=usb0
+
+[Network]
+Address=10.55.0.1/24
+DHCPServer=yes
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+
+[DHCPServer]
+PoolOffset=10
+PoolSize=16
+EmitDNS=no
+DefaultLeaseTimeSec=1h
+MaxLeaseTimeSec=12h
+

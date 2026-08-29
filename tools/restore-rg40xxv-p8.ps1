@@ -1,0 +1,224 @@
+param(
+    [string]$DriveLetter = "H",
+    [string]$BackupPath = "\\wsl.localhost\Ubuntu\root\kernel\lab\candidates\rg40xxv-de33-pageflip-nopulse-v1\rg40xxv-de33-pageflip-nopulse-v1-persistent-legacy-p8.img",
+    [string]$LogPath = "$env:TEMP\rg40xxv-p8-v3-to-9b-rollback.log"
+)
+
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+
+$ExpectedDiskBytes = [Int64]62516101120
+$ExpectedDiskGuid = "ab6f3888-569a-4926-9668-80941dcb40bc"
+$ExpectedPartitionCount = 8
+$P4Offset = [Int64]47332720640
+$P4Bytes = [Int64]67108864
+$P4Sha256 = "09bb1eee75a3ae1b2950c0886c0777abd1a48a266e045376a1b9e098894fc519"
+$P8Offset = [Int64]61890101248
+$P8Bytes = [Int64]67108864
+$KnownBadP8Sha256 = "f96a3cccd4f5161248b13c05c91f5841724192ee617c903ec2e23805d91ab61f"
+$BackupP8Sha256 = "9bffb5f176a377597ac402cc364a344bda2c51a371bd6ec9b430f9de86ca6101"
+$BufferBytes = 4MB
+$ExpectedPartitionLayout = @(
+    [pscustomobject]@{ Number = 1; Offset = [Int64]37748736;    Size = [Int64]47244640256; Drive = "H" }
+    [pscustomobject]@{ Number = 2; Offset = [Int64]47282388992; Size = [Int64]33554432;    Drive = "" }
+    [pscustomobject]@{ Number = 3; Offset = [Int64]47315943424; Size = [Int64]16777216;    Drive = "" }
+    [pscustomobject]@{ Number = 4; Offset = [Int64]47332720640; Size = [Int64]67108864;    Drive = "" }
+    [pscustomobject]@{ Number = 5; Offset = [Int64]47399829504; Size = [Int64]7516192768;  Drive = "" }
+    [pscustomobject]@{ Number = 6; Offset = [Int64]54916022272; Size = [Int64]4294967296;  Drive = "" }
+    [pscustomobject]@{ Number = 7; Offset = [Int64]59210989568; Size = [Int64]2679111680;  Drive = "" }
+    [pscustomobject]@{ Number = 8; Offset = [Int64]61890101248; Size = [Int64]67108864;    Drive = "" }
+)
+
+function Write-Log([string]$Message) {
+    $line = "{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $Message
+    $line | Tee-Object -FilePath $LogPath -Append
+}
+
+function Assert-Equal($Actual, $Expected, [string]$Name) {
+    if ($Actual -ne $Expected) {
+        throw "$Name mismatch: actual=$Actual expected=$Expected"
+    }
+}
+
+function Get-RangeSha256([string]$Path, [Int64]$Offset, [Int64]$Length) {
+    $stream = [System.IO.FileStream]::new(
+        $Path,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::ReadWrite,
+        $BufferBytes,
+        [System.IO.FileOptions]::SequentialScan
+    )
+    $hash = [System.Security.Cryptography.IncrementalHash]::CreateHash(
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256
+    )
+    try {
+        [void]$stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+        $buffer = [byte[]]::new($BufferBytes)
+        $remaining = $Length
+        while ($remaining -gt 0) {
+            $wanted = [int][Math]::Min([Int64]$buffer.Length, $remaining)
+            $read = $stream.Read($buffer, 0, $wanted)
+            if ($read -le 0) {
+                throw "Unexpected EOF while hashing $Path at offset $($stream.Position)"
+            }
+            $hash.AppendData($buffer, 0, $read)
+            $remaining -= $read
+        }
+        return ([BitConverter]::ToString($hash.GetHashAndReset()).Replace("-", "").ToLowerInvariant())
+    }
+    finally {
+        $hash.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Write-ImageRange([string]$ImagePath, [string]$DevicePath, [Int64]$Offset, [Int64]$Length) {
+    $source = [System.IO.FileStream]::new(
+        $ImagePath,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read,
+        $BufferBytes,
+        [System.IO.FileOptions]::SequentialScan
+    )
+    $target = [System.IO.FileStream]::new(
+        $DevicePath,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::ReadWrite,
+        $BufferBytes,
+        [System.IO.FileOptions]::WriteThrough
+    )
+    try {
+        [void]$target.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+        $buffer = [byte[]]::new($BufferBytes)
+        $remaining = $Length
+        while ($remaining -gt 0) {
+            $wanted = [int][Math]::Min([Int64]$buffer.Length, $remaining)
+            $read = $source.Read($buffer, 0, $wanted)
+            if ($read -le 0) {
+                throw "Unexpected EOF in backup image"
+            }
+            $target.Write($buffer, 0, $read)
+            $remaining -= $read
+        }
+        if ($source.Position -ne $Length) {
+            throw "Backup image length changed while writing"
+        }
+        $target.Flush($true)
+    }
+    finally {
+        $target.Dispose()
+        $source.Dispose()
+    }
+}
+
+Set-Content -LiteralPath $LogPath -Value "RG40XX-V p8 rollback from failed v3 to 9b"
+
+$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Administrator token is required"
+}
+
+Write-Log "PRECHECK drive=$($DriveLetter): backup=$BackupPath"
+$backup = Get-Item -LiteralPath $BackupPath
+Assert-Equal ([Int64]$backup.Length) $P8Bytes "backup size"
+$backupHash = (Get-FileHash -LiteralPath $BackupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+Assert-Equal $backupHash $BackupP8Sha256 "backup SHA256"
+Write-Log "BACKUP_OK bytes=$($backup.Length) sha256=$backupHash"
+
+$partition = Get-Partition -DriveLetter $DriveLetter
+$disk = $partition | Get-Disk
+$partitions = @(Get-Partition -DiskNumber $disk.Number | Sort-Object PartitionNumber)
+
+Assert-Equal ([Int64]$disk.Size) $ExpectedDiskBytes "disk size"
+Assert-Equal $disk.PartitionStyle.ToString() "GPT" "partition style"
+Assert-Equal $disk.BusType.ToString() "USB" "bus type"
+Assert-Equal $disk.Guid.ToString().Trim("{}") $ExpectedDiskGuid "GPT disk GUID"
+Assert-Equal $partitions.Count $ExpectedPartitionCount "partition count"
+Assert-Equal $partition.PartitionNumber 1 "H partition number"
+
+foreach ($expected in $ExpectedPartitionLayout) {
+    $actual = $partitions | Where-Object PartitionNumber -eq $expected.Number
+    if ($null -eq $actual) {
+        throw "p$($expected.Number) is missing"
+    }
+    Assert-Equal ([Int64]$actual.Offset) ([Int64]$expected.Offset) "p$($expected.Number) offset"
+    Assert-Equal ([Int64]$actual.Size) ([Int64]$expected.Size) "p$($expected.Number) size"
+    $actualDrive = if (
+        $null -eq $actual.DriveLetter -or
+        [string]::IsNullOrWhiteSpace([string]$actual.DriveLetter)
+    ) {
+        ""
+    }
+    else {
+        ([string]$actual.DriveLetter).ToUpperInvariant()
+    }
+    Assert-Equal $actualDrive $expected.Drive "p$($expected.Number) drive letter"
+}
+Write-Log "LAYOUT_OK p1-p8 offsets_sizes_and_drive_letters=EXACT"
+
+$p4 = $partitions | Where-Object PartitionNumber -eq 4
+$p8 = $partitions | Where-Object PartitionNumber -eq 8
+Assert-Equal ([Int64]$p4.Offset) $P4Offset "p4 offset"
+Assert-Equal ([Int64]$p4.Size) $P4Bytes "p4 size"
+Assert-Equal ([Int64]$p8.Offset) $P8Offset "p8 offset"
+Assert-Equal ([Int64]$p8.Size) $P8Bytes "p8 size"
+
+$diskNumber = $disk.Number
+$devicePath = "\\.\PhysicalDrive$diskNumber"
+Write-Log "CARD_OK disk=$diskNumber bytes=$($disk.Size) guid=$($disk.Guid) p8_offset=$P8Offset p8_bytes=$P8Bytes"
+
+$wasOffline = [bool]$disk.IsOffline
+$madeOffline = $false
+$removedAccessPath = $false
+$accessPath = "$($DriveLetter):\"
+try {
+    if (-not $wasOffline) {
+        if ($disk.BusType.ToString() -eq "USB") {
+            Write-Log "Dismounting only $accessPath for removable-media raw access"
+            Remove-PartitionAccessPath -DiskNumber $diskNumber -PartitionNumber $partition.PartitionNumber -AccessPath $accessPath
+            $removedAccessPath = $true
+        }
+        else {
+            Write-Log "Taking only PhysicalDrive$diskNumber offline for exclusive raw access"
+            Set-Disk -Number $diskNumber -IsOffline $true
+            $madeOffline = $true
+        }
+    }
+
+    $p4Hash = Get-RangeSha256 $devicePath $P4Offset $P4Bytes
+    Assert-Equal $p4Hash $P4Sha256 "p4 SHA256"
+    Write-Log "P4_OK sha256=$p4Hash"
+
+    $currentP8Hash = Get-RangeSha256 $devicePath $P8Offset $P8Bytes
+    Write-Log "CURRENT_P8 sha256=$currentP8Hash"
+    if ($currentP8Hash -eq $BackupP8Sha256) {
+        Write-Log "RESTORE_ALREADY_COMPLETE"
+    }
+    elseif ($currentP8Hash -eq $KnownBadP8Sha256) {
+        Write-Log "Writing exactly 64 MiB to p8; no other byte range is targeted"
+        Write-ImageRange $BackupPath $devicePath $P8Offset $P8Bytes
+        $readbackHash = Get-RangeSha256 $devicePath $P8Offset $P8Bytes
+        Assert-Equal $readbackHash $BackupP8Sha256 "p8 readback SHA256"
+        $p4AfterHash = Get-RangeSha256 $devicePath $P4Offset $P4Bytes
+        Assert-Equal $p4AfterHash $P4Sha256 "p4 post-write SHA256"
+        Write-Log "RESTORE_PASS p8_sha256=$readbackHash p4=UNCHANGED"
+    }
+    else {
+        throw "Current p8 is neither the known bad image nor the known-good backup; refusing write (sha256=$currentP8Hash)"
+    }
+}
+finally {
+    if ($madeOffline) {
+        Set-Disk -Number $diskNumber -IsOffline $false
+        Write-Log "PhysicalDrive$diskNumber returned online"
+    }
+    if ($removedAccessPath) {
+        Add-PartitionAccessPath -DiskNumber $diskNumber -PartitionNumber $partition.PartitionNumber -AccessPath $accessPath
+        Write-Log "$accessPath mounted again"
+    }
+}
+
+Write-Log "DONE_SAFE_TO_EJECT"

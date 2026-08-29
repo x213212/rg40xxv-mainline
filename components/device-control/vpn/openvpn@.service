@@ -1,0 +1,29 @@
+[Unit]
+Description=RG40XXV OpenVPN client profile %i
+Documentation=file:/usr/share/doc/rg40xxv-device-control/README-zh-TW.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStartPre=/usr/sbin/vpn-profilectl verify %i
+ExecStartPre=/usr/sbin/vpn-firewall apply %i
+ExecStart=/usr/sbin/openvpn --config /var/lib/rg40xxv/openvpn/profiles/%i/client.conf --auth-nocache --verb 3 --suppress-timestamps
+Restart=always
+RestartSec=3s
+TimeoutStartSec=45s
+TimeoutStopSec=15s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/var/lib/rg40xxv/openvpn/profiles/%i
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rg40xxv-openvpn-%i
+
+[Install]
+WantedBy=multi-user.target
+

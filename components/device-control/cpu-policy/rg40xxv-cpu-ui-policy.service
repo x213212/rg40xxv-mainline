@@ -1,0 +1,16 @@
+[Unit]
+Description=RG40XXV UI schedutil CPU policy
+Documentation=file:/usr/share/doc/rg40xxv-device-control/README-zh-TW.md
+After=local-fs.target
+StartLimitIntervalSec=30s
+StartLimitBurst=20
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/cpu-policyctl ui-default
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=250ms
+
+[Install]
+WantedBy=multi-user.target

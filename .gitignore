@@ -1,0 +1,51 @@
+# Build tree, downloads and output are reproducible from patches/ + configs/.
+build/
+downloads/
+out/
+
+# Kernel build leftovers, if anyone builds in place.
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.d
+*.dtb
+*.dtbo
+Image
+vmlinux*
+System.map
+.config
+.config.old
+
+# Patch and editor leftovers.
+*.orig
+*.rej
+*.before-*
+*~
+*.bak
+*.bak-*
+
+# Logs may carry device paths and card identifiers.
+*.log
+
+# Key material. Nothing in this project needs a private key.
+*.pem
+*.key
+*.ppk
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*_ed25519*
+.ssh/
+.env
+.env.*
+
+# Never publish card images or dumps: they carry vendor firmware and whatever
+# was on the card.
+*.img
+*.img.*
+*.bin
+backup/
+backups/

@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SAFE_PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+die() {
+    printf 'ui-hardwarectl: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    printf '%s\n' \
+        "用法：$0 screen-off" \
+        "      $0 screen-on" \
+        "      $0 brightness 0..100" \
+        "      $0 joystick-rgb 0..100" \
+		"      $0 volume 0..100" \
+		"      $0 volume-up" \
+		"      $0 volume-down" \
+		"      $0 mute-toggle" \
+        "      $0 usb-debug {on|off}" \
+		"      $0 network-wifi-recover" \
+		"      $0 network-status" \
+		"      $0 network-wifi-scan" \
+		"      $0 network-wifi-connect BSSID  # 密碼只由 stdin 傳入" \
+		"      $0 network-wifi-disconnect" \
+		"      $0 network-wifi-forget UUID" \
+		"      $0 network-hotspot {on|off}" \
+		"      $0 reboot-custom" \
+        "      $0 orderly-shutdown" >&2
+    exit 2
+}
+
+validate_percent() {
+    [[ $1 =~ ^[0-9]{1,3}$ ]] || die '百分比只接受十進位 0..100'
+    ((10#$1 <= 100)) || die '百分比只接受十進位 0..100'
+}
+
+init_helpers() {
+    local script_dir test_root
+    script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        test_root=${DEVICE_CONTROL_TEST_ROOT:-}
+        [[ $test_root == /tmp/rg40xxv-device-control-test.* ]] || \
+            die '測試根目錄不符合固定 /tmp 前綴'
+        [[ -d "$test_root" && ! -L "$test_root" ]] || die '無效測試根目錄'
+        [[ -d "$test_root/rootfs" && ! -L "$test_root/rootfs" ]] || \
+            die '無效測試 rootfs'
+        power_lockctl="$script_dir/../power-lock/power-lockctl"
+        usb_debugctl="$script_dir/../usb-debug/usb-debugctl"
+		volume_ctl="$test_root/mock-bin/rg40xxv-volume-ctl"
+		network_control="$test_root/mock-bin/rg40xxv-network-control"
+		reboot_target="$test_root/mock-bin/rg40xxv-reboot-target"
+        systemctl="$test_root/mock-bin/systemctl"
+        helper_env=(
+            env -i
+            PATH="$SAFE_PATH"
+            LC_ALL=C
+            DEVICE_CONTROL_TESTING=1
+            DEVICE_CONTROL_TEST_ROOT="$test_root"
+        )
+        if [[ -n ${POWER_LOCK_TEST_FAIL_STEP:-} ]]; then
+            helper_env+=(POWER_LOCK_TEST_FAIL_STEP="$POWER_LOCK_TEST_FAIL_STEP")
+        fi
+        if [[ -n ${POWER_LOCK_TEST_FAIL_AFTER:-} ]]; then
+            helper_env+=(POWER_LOCK_TEST_FAIL_AFTER="$POWER_LOCK_TEST_FAIL_AFTER")
+        fi
+    else
+        power_lockctl=/usr/sbin/power-lockctl
+        usb_debugctl=/usr/libexec/rg40xxv/usb-debugctl
+		volume_ctl=/usr/libexec/rg40xxv/rg40xxv-volume-ctl
+		network_control=/usr/sbin/rg40xxv-network-control
+		reboot_target=/usr/sbin/rg40xxv-reboot-target
+        systemctl=/usr/bin/systemctl
+        helper_env=(env -i PATH="$SAFE_PATH" LC_ALL=C)
+    fi
+
+	case $command in
+		screen-off|screen-on|brightness|joystick-rgb)
+			[[ -f "$power_lockctl" && ! -L "$power_lockctl" && -x "$power_lockctl" ]] || \
+				die "power-lockctl 不可用：$power_lockctl"
+			;;
+		volume|volume-up|volume-down|mute-toggle)
+			[[ -f "$volume_ctl" && ! -L "$volume_ctl" && -x "$volume_ctl" ]] || \
+				 die "rg40xxv-volume-ctl 不可用：$volume_ctl"
+			;;
+		network-*)
+			[[ -f "$network_control" && ! -L "$network_control" && -x "$network_control" ]] || \
+				die "rg40xxv-network-control 不可用：$network_control"
+			;;
+		reboot-custom)
+			[[ -f "$reboot_target" && ! -L "$reboot_target" && -x "$reboot_target" ]] || \
+				die "rg40xxv-reboot-target 不可用：$reboot_target"
+			;;
+		usb-debug)
+			[[ -f "$usb_debugctl" && ! -L "$usb_debugctl" && -x "$usb_debugctl" ]] || \
+				die "usb-debugctl 不可用：$usb_debugctl"
+			;;
+		orderly-shutdown) ;;
+	esac
+}
+
+run_power_lock() {
+    "${helper_env[@]}" "$power_lockctl" hardware "$@"
+}
+
+run_usb_debug() {
+    "${helper_env[@]}" "$usb_debugctl" "$1"
+}
+
+run_volume() {
+	"${helper_env[@]}" "$volume_ctl" "$@"
+}
+
+run_network_control() {
+	"${helper_env[@]}" "$network_control" "$@"
+}
+
+run_custom_reboot() {
+	# UI 的一般重啟只有這一條固定 argv；不得接受 stock/fastboot/poweroff。
+	"${helper_env[@]}" "$reboot_target" custom
+}
+
+command=${1:-}
+case $command in
+    screen-off|screen-on)
+        (($# == 1)) || usage
+        ;;
+    brightness|joystick-rgb|volume)
+        (($# == 2)) || usage
+        validate_percent "$2"
+        ;;
+	volume-up|volume-down|mute-toggle)
+		(($# == 1)) || usage
+		;;
+	network-status|network-wifi-recover|network-wifi-scan|network-wifi-disconnect)
+		(($# == 1)) || usage
+		;;
+	network-wifi-connect)
+		(($# == 2)) || usage
+		[[ $2 =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || \
+			die 'network-wifi-connect 只接受 canonical BSSID'
+		;;
+	network-wifi-forget)
+		(($# == 2)) || usage
+		[[ $2 =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[1-5][[:xdigit:]]{3}-[89ABab][[:xdigit:]]{3}-[[:xdigit:]]{12}$ ]] || \
+			die 'network-wifi-forget 只接受 canonical UUID'
+		;;
+	network-hotspot)
+		(($# == 2)) || usage
+		[[ $2 == on || $2 == off ]] || die 'network-hotspot 只接受 on/off'
+		;;
+	reboot-custom)
+		(($# == 1)) || usage
+		;;
+    usb-debug)
+        (($# == 2)) || usage
+        [[ $2 == on || $2 == off ]] || die 'usb-debug 只接受 on/off'
+        ;;
+    orderly-shutdown)
+        (($# == 1)) || usage
+        ;;
+    *) usage ;;
+esac
+
+init_helpers
+
+case $command in
+    screen-off) run_power_lock screen-off ;;
+    screen-on) run_power_lock screen-on ;;
+    brightness) run_power_lock brightness "$2" ;;
+    joystick-rgb) run_power_lock joystick-rgb "$2" ;;
+	volume) run_volume set "$2" ;;
+	volume-up) run_volume up ;;
+	volume-down) run_volume down ;;
+	mute-toggle) run_volume mute-toggle ;;
+	network-status) run_network_control status ;;
+	network-wifi-recover) run_network_control recover ;;
+	network-wifi-scan) run_network_control scan ;;
+	network-wifi-connect) run_network_control connect "${2^^}" ;;
+	network-wifi-disconnect) run_network_control disconnect ;;
+	network-wifi-forget) run_network_control forget "${2,,}" ;;
+	network-hotspot) run_network_control hotspot "$2" ;;
+	reboot-custom) run_custom_reboot ;;
+    usb-debug)
+        if [[ $2 == on ]]; then run_usb_debug start; else run_usb_debug stop; fi
+        ;;
+    orderly-shutdown)
+        if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+            [[ -d ${DEVICE_CONTROL_TEST_ROOT}/mock-bin && ! -L ${DEVICE_CONTROL_TEST_ROOT}/mock-bin ]] || \
+                die 'shutdown mock 目錄無效'
+            [[ -f "$systemctl" && ! -L "$systemctl" && -x "$systemctl" ]] || \
+                die 'shutdown 測試只能使用固定 fixture mock'
+        else
+            [[ $systemctl == /usr/bin/systemctl && -x $systemctl && ! -L $systemctl ]] || \
+                die '固定 /usr/bin/systemctl 不可用'
+        fi
+        "${helper_env[@]}" "$systemctl" poweroff
+        ;;
+esac

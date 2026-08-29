@@ -1,0 +1,20 @@
+[Unit]
+Description=RG40XXV RNDIS and CDC ACM USB debug gadget
+Documentation=file:/usr/share/doc/rg40xxv-device-control/README-zh-TW.md
+Wants=sys-kernel-config.mount network-pre.target
+After=systemd-modules-load.service sys-kernel-config.mount
+Before=network-pre.target
+ConditionPathExists=/sys/class/udc
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/rg40xxv-usb-debug
+ExecStart=/usr/libexec/rg40xxv/usb-debugctl start
+ExecStop=/usr/libexec/rg40xxv/usb-debugctl stop
+RemainAfterExit=yes
+TimeoutStartSec=10s
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=multi-user.target
+

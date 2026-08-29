@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() {
+    printf 'vpn-profilectl: %s\n' "$*" >&2
+    exit 1
+}
+
+init_paths() {
+    root_prefix=
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        test_root=${DEVICE_CONTROL_TEST_ROOT:-}
+        [[ "$test_root" == /tmp/rg40xxv-device-control-test.* ]] || die '測試根目錄不符合固定 /tmp 前綴'
+        [[ -d "$test_root/rootfs" && ! -L "$test_root/rootfs" ]] || die '無效測試 rootfs'
+        root_prefix="$test_root/rootfs"
+    fi
+    vpn_root="${root_prefix}/var/lib/rg40xxv/openvpn"
+    profiles_dir="$vpn_root/profiles"
+    policy_file="$vpn_root/traffic-policy.v1"
+}
+
+valid_name() {
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]]
+}
+
+profile_path() {
+    valid_name "$1" || die 'profile 名稱格式不正確'
+    printf '%s/%s' "$profiles_dir" "$1"
+}
+
+safe_source() {
+    [[ -f $1 && ! -L $1 && -r $1 ]] || die '匯入來源必須是可讀一般檔案且不可為 symlink'
+    (($(stat -c '%s' -- "$1") <= 1048576)) || die '匯入檔案超過 1 MiB'
+}
+
+copy_secret() {
+    safe_source "$1"
+    install -m 0600 -- "$1" "$2"
+}
+
+sanitize_ovpn() {
+    local source=$1 destination=$2 ca=$3 cert=$4 key=$5 auth=$6 line stripped token lower
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        stripped=${line#"${line%%[!$' \t']*}"}
+        if [[ -z "$stripped" || $stripped == \#* || $stripped == \;* || $stripped == '<'* ]]; then
+            printf '%s\n' "$line" >>"$destination"
+            continue
+        fi
+        token=${stripped%%[$' \t']*}
+        lower=${token,,}
+        case "$lower" in
+            up|down|route-up|route-pre-down|ipchange|client-connect|client-disconnect|learn-address|plugin|management|management-client-auth|script-security|config|include|log|log-append|status|writepid|daemon|askpass)
+                die "ovpn 含禁止 directive：$lower"
+                ;;
+            tls-auth|tls-crypt|secret|pkcs12|dh|crl-verify|extra-certs)
+                die "外部金鑰 directive 尚未安全封裝：$lower；請改用 inline block"
+                ;;
+            ca)
+                [[ -n "$ca" ]] || die 'ovpn 使用外部 ca，但未提供 --ca'
+                ;;
+            cert)
+                [[ -n "$cert" ]] || die 'ovpn 使用外部 cert，但未提供 --cert'
+                ;;
+            key)
+                [[ -n "$key" ]] || die 'ovpn 使用外部 key，但未提供 --key'
+                ;;
+            auth-user-pass)
+                [[ -n "$auth" ]] || die 'ovpn 使用 auth-user-pass，但未提供 --auth'
+                ;;
+            *) printf '%s\n' "$line" >>"$destination" ;;
+        esac
+    done <"$source"
+    [[ -n "$ca" ]] && printf 'ca ca.crt\n' >>"$destination"
+    [[ -n "$cert" ]] && printf 'cert client.crt\n' >>"$destination"
+    [[ -n "$key" ]] && printf 'key client.key\n' >>"$destination"
+    [[ -n "$auth" ]] && printf 'auth-user-pass auth.txt\n' >>"$destination"
+    printf 'auth-nocache\nverb 3\n' >>"$destination"
+}
+
+write_settings() {
+    local dir=$1 tmp
+    tmp=$(mktemp "$dir/.settings.XXXXXX")
+    {
+        printf 'version=1\n'
+        printf 'autoconnect=%s\n' "$AUTOCONNECT"
+        printf 'kill_switch=%s\n' "$KILL_SWITCH"
+        printf 'endpoint_ip=%s\n' "$ENDPOINT_IP"
+        printf 'endpoint_port=%s\n' "$ENDPOINT_PORT"
+        printf 'endpoint_proto=%s\n' "$ENDPOINT_PROTO"
+        printf 'tun_interface=%s\n' "$TUN_INTERFACE"
+    } >"$tmp"
+    chmod 0600 "$tmp"
+    mv -f -- "$tmp" "$dir/settings.v1"
+}
+
+load_settings() {
+    local dir=$1 field value
+    AUTOCONNECT=true
+    KILL_SWITCH=false
+    ENDPOINT_IP='unset'
+    ENDPOINT_PORT=0
+    ENDPOINT_PROTO=udp
+    TUN_INTERFACE=tun0
+    [[ -f "$dir/settings.v1" && ! -L "$dir/settings.v1" ]] || die 'profile settings 不存在'
+    while IFS='=' read -r field value; do
+        case "$field" in
+            version) [[ $value == 1 ]] || die 'settings version 不支援' ;;
+            autoconnect) [[ $value == true || $value == false ]] || die 'autoconnect 損壞'; AUTOCONNECT=$value ;;
+            kill_switch) [[ $value == true || $value == false ]] || die 'kill_switch 損壞'; KILL_SWITCH=$value ;;
+            endpoint_ip) ENDPOINT_IP=$value ;;
+            endpoint_port) ENDPOINT_PORT=$value ;;
+            endpoint_proto) ENDPOINT_PROTO=$value ;;
+            tun_interface) TUN_INTERFACE=$value ;;
+            '') ;;
+            *) die 'settings 含未知欄位' ;;
+        esac
+    done <"$dir/settings.v1"
+    validate_settings || die 'profile settings 格式不安全或已損壞'
+}
+
+valid_ipv4() {
+    local IFS=. octets octet
+    read -r -a octets <<<"$1"
+    ((${#octets[@]} == 4)) || return 1
+    for octet in "${octets[@]}"; do
+        [[ $octet =~ ^[0-9]{1,3}$ ]] || return 1
+        ((10#$octet <= 255)) || return 1
+    done
+}
+
+validate_settings() {
+    [[ $AUTOCONNECT == true || $AUTOCONNECT == false ]] || return 1
+    [[ $KILL_SWITCH == true || $KILL_SWITCH == false ]] || return 1
+    [[ $TUN_INTERFACE =~ ^(tun|tap)[0-9]{1,3}$ ]] || return 1
+    [[ $ENDPOINT_PROTO == udp || $ENDPOINT_PROTO == tcp ]] || return 1
+    [[ $ENDPOINT_PORT =~ ^[0-9]{1,5}$ ]] || return 1
+    ((10#$ENDPOINT_PORT <= 65535)) || return 1
+    if [[ $ENDPOINT_IP != unset ]]; then valid_ipv4 "$ENDPOINT_IP" || return 1; fi
+    if [[ $ENDPOINT_IP != unset ]]; then ((10#$ENDPOINT_PORT >= 1)) || return 1; fi
+    if [[ $KILL_SWITCH == true ]]; then
+        [[ $ENDPOINT_IP != unset && $ENDPOINT_PORT != 0 ]] || return 1
+    fi
+}
+
+remote_matches_endpoint() {
+    local config=$1
+    awk -v ip="$ENDPOINT_IP" -v port="$ENDPOINT_PORT" '
+        /^[[:space:]]*[#;]/ { next }
+        tolower($1) == "remote" && $2 == ip && $3 == port { found=1 }
+        END { exit(found ? 0 : 1) }
+    ' "$config"
+}
+
+import_profile() {
+    local name=$1 ovpn='' ca='' cert='' key='' auth='' dir stage option
+    shift
+    while (($#)); do
+        option=$1
+        shift
+        (($#)) || die "$option 缺少檔案"
+        case "$option" in
+            --ovpn) [[ -z "$ovpn" ]] || die '重複 --ovpn'; ovpn=$1 ;;
+            --ca) [[ -z "$ca" ]] || die '重複 --ca'; ca=$1 ;;
+            --cert) [[ -z "$cert" ]] || die '重複 --cert'; cert=$1 ;;
+            --key) [[ -z "$key" ]] || die '重複 --key'; key=$1 ;;
+            --auth) [[ -z "$auth" ]] || die '重複 --auth'; auth=$1 ;;
+            *) die '未知 import 選項' ;;
+        esac
+        shift
+    done
+    [[ -n "$ovpn" ]] || die '缺少 --ovpn'
+    [[ ( -n "$cert" && -n "$key" ) || ( -z "$cert" && -z "$key" ) ]] || die 'cert/key 必須成對'
+    safe_source "$ovpn"
+    dir=$(profile_path "$name")
+    [[ ! -e "$dir" ]] || die 'profile 已存在；拒絕靜默覆蓋'
+    mkdir -p -- "$profiles_dir"
+    chmod 0700 "$vpn_root" "$profiles_dir"
+    stage=$(mktemp -d "$profiles_dir/.import.${name}.XXXXXX")
+    IMPORT_STAGE=$stage
+    : >"$stage/client.conf"
+    sanitize_ovpn "$ovpn" "$stage/client.conf" "$ca" "$cert" "$key" "$auth"
+    [[ -n "$ca" ]] && copy_secret "$ca" "$stage/ca.crt"
+    [[ -n "$cert" ]] && copy_secret "$cert" "$stage/client.crt"
+    [[ -n "$key" ]] && copy_secret "$key" "$stage/client.key"
+    [[ -n "$auth" ]] && copy_secret "$auth" "$stage/auth.txt"
+    chmod 0600 "$stage/client.conf"
+    AUTOCONNECT=true KILL_SWITCH=false ENDPOINT_IP=unset ENDPOINT_PORT=0 ENDPOINT_PROTO=udp TUN_INTERFACE=tun0
+    write_settings "$stage"
+    chmod 0700 "$stage"
+    mv -- "$stage" "$dir"
+    IMPORT_STAGE=
+    printf 'profile=%s\nautoconnect=true\nkill_switch=false\n' "$name"
+}
+
+verify_profile() {
+    local name=$1 dir file mode
+    dir=$(profile_path "$name")
+    [[ -d "$dir" && ! -L "$dir" ]] || die 'profile 不存在或是 symlink'
+    [[ $(stat -c '%a' "$dir") == 700 ]] || die 'profile 目錄不是 0700'
+    for file in "$dir"/*; do
+        [[ -f "$file" && ! -L "$file" ]] || die 'profile 含非一般檔案'
+        mode=$(stat -c '%a' "$file")
+        [[ $mode == 600 ]] || die 'profile 檔案不是 0600'
+    done
+    load_settings "$dir"
+    if [[ $KILL_SWITCH == true ]]; then
+        remote_matches_endpoint "$dir/client.conf" || die 'kill switch endpoint 與 remote 不符'
+    fi
+    if grep -Eiq '^[[:space:]]*(up|down|route-up|route-pre-down|plugin|management|script-security|config|include|log|log-append|status)([[:space:]]|$)' "$dir/client.conf"; then
+        die 'client.conf 出現禁止 directive'
+    fi
+    printf 'profile=%s\nvalid=true\nautoconnect=%s\nkill_switch=%s\n' "$name" "$AUTOCONNECT" "$KILL_SWITCH"
+}
+
+set_profile() {
+    local name=$1 setting=$2 dir
+    shift 2
+    dir=$(profile_path "$name")
+    load_settings "$dir"
+    case "$setting" in
+        autoconnect)
+            if (($# != 1)) || [[ $1 != true && $1 != false ]]; then
+                die 'autoconnect 只接受 true|false'
+            fi
+            AUTOCONNECT=$1
+            ;;
+        kill-switch)
+            if (($# != 1)) || [[ $1 != true && $1 != false ]]; then
+                die 'kill-switch 只接受 true|false'
+            fi
+            KILL_SWITCH=$1
+            ;;
+        endpoint)
+            (($# == 3)) || die 'endpoint 需要 IPv4 port udp|tcp'
+            ENDPOINT_IP=$1 ENDPOINT_PORT=$2 ENDPOINT_PROTO=$3
+            ;;
+        tun-interface)
+            (($# == 1)) || die 'tun-interface 需要 tunN/tapN'
+            TUN_INTERFACE=$1
+            ;;
+        *) die '未知 profile setting' ;;
+    esac
+    validate_settings || die '設定組合不安全或格式錯誤'
+    if [[ $KILL_SWITCH == true ]]; then
+        remote_matches_endpoint "$dir/client.conf" || \
+            die 'kill switch endpoint 必須和 client.conf 的數字 remote/port 相符'
+    fi
+    write_settings "$dir"
+    printf '%s=updated\n' "$setting"
+}
+
+load_policy() {
+    local field value
+    MOONLIGHT_POLICY=bypass
+    GAMES_POLICY=vpn
+    [[ -f "$policy_file" && ! -L "$policy_file" ]] || return 0
+    while IFS='=' read -r field value; do
+        case "$field" in
+            version) [[ $value == 1 ]] || die 'policy version 不支援' ;;
+            moonlight) [[ $value == bypass || $value == vpn ]] || die 'moonlight policy 損壞'; MOONLIGHT_POLICY=$value ;;
+            games) [[ $value == bypass || $value == vpn ]] || die 'games policy 損壞'; GAMES_POLICY=$value ;;
+            '') ;;
+            *) die 'policy 含未知欄位' ;;
+        esac
+    done <"$policy_file"
+}
+
+save_policy() {
+    local tmp
+    mkdir -p -- "$vpn_root"
+    chmod 0700 "$vpn_root"
+    tmp=$(mktemp "$vpn_root/.policy.XXXXXX")
+    printf 'version=1\nmoonlight=%s\ngames=%s\n' "$MOONLIGHT_POLICY" "$GAMES_POLICY" >"$tmp"
+    chmod 0600 "$tmp"
+    mv -f -- "$tmp" "$policy_file"
+}
+
+init_paths
+IMPORT_STAGE=
+cleanup_import_stage() {
+    if [[ -n "$IMPORT_STAGE" && "$IMPORT_STAGE" == "$profiles_dir/.import."* && -d "$IMPORT_STAGE" && ! -L "$IMPORT_STAGE" ]]; then
+        rm -rf -- "$IMPORT_STAGE"
+    fi
+}
+trap cleanup_import_stage EXIT
+case ${1:-} in
+    import)
+        (($# >= 4)) || die 'import 參數不足'
+        name=$2
+        shift 2
+        import_profile "$name" "$@"
+        ;;
+    verify)
+        (($# == 2)) || die 'verify 需要 profile 名稱'
+        verify_profile "$2"
+        ;;
+    profile)
+        [[ ${2:-} == set ]] || die 'profile 只接受 set'
+        (($# >= 5)) || die 'profile set 參數不足'
+        name=$3 setting=$4
+        shift 4
+        set_profile "$name" "$setting" "$@"
+        ;;
+    policy)
+        load_policy
+        case ${2:-} in
+            get)
+                (($# == 3)) || die 'policy get 需要 moonlight|games'
+                case $3 in moonlight) printf '%s\n' "$MOONLIGHT_POLICY" ;; games) printf '%s\n' "$GAMES_POLICY" ;; *) die '未知 traffic class' ;; esac
+                ;;
+            set)
+                (($# == 4)) || die 'policy set 需要 class bypass|vpn'
+                [[ $4 == bypass || $4 == vpn ]] || die 'policy 只接受 bypass|vpn'
+                case $3 in moonlight) MOONLIGHT_POLICY=$4 ;; games) GAMES_POLICY=$4 ;; *) die '未知 traffic class' ;; esac
+                save_policy
+                printf '%s=%s\n' "$3" "$4"
+                ;;
+            *) die 'policy 只接受 get/set' ;;
+        esac
+        ;;
+    *)
+        printf '用法：%s import NAME --ovpn FILE [--ca FILE --cert FILE --key FILE --auth FILE]\n' "$0" >&2
+        printf '      %s verify NAME\n' "$0" >&2
+        printf '      %s profile set NAME {autoconnect|kill-switch|endpoint|tun-interface} ...\n' "$0" >&2
+        printf '      %s policy {get CLASS|set CLASS bypass|vpn}\n' "$0" >&2
+        exit 2
+        ;;
+esac

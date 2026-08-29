@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MAX_UDC_ENTRIES=8
+
+die() {
+    printf 'usb-debugctl: %s\n' "$*" >&2
+    exit 1
+}
+
+init_paths() {
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        test_root=${DEVICE_CONTROL_TEST_ROOT:-}
+        [[ "$test_root" == /tmp/rg40xxv-device-control-test.* ]] || \
+            die '測試根目錄不符合固定 /tmp 前綴'
+        [[ -d "$test_root" && ! -L "$test_root" ]] || die '無效測試根目錄'
+        configfs_root="$test_root/configfs"
+        sys_root="$test_root/sys"
+    else
+        configfs_root=/sys/kernel/config
+        sys_root=/sys
+    fi
+    udc_root="$sys_root/class/udc"
+    gadget="$configfs_root/usb_gadget/rg40xxv_debug"
+}
+
+path_has_no_symlink() {
+    local path=$1 relative component current=$sys_root
+    [[ $path == "$sys_root" || $path == "$sys_root/"* ]] || return 1
+    [[ -d "$sys_root" && ! -L "$sys_root" ]] || return 1
+    relative=${path#"$sys_root"/}
+    IFS=/ read -r -a components <<<"$relative"
+    for component in "${components[@]}"; do
+        [[ -n $component && $component != . && $component != .. ]] || return 1
+        current="$current/$component"
+        [[ ! -L "$current" ]] || return 1
+    done
+}
+
+validate_text() {
+    local label=$1 value=$2
+    [[ -n "$value" && ${#value} -le 64 && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || \
+        die "$label 格式不正確"
+}
+
+validate_mac() {
+    [[ $1 =~ ^[[:xdigit:]]{2}(:[[:xdigit:]]{2}){5}$ ]] || die 'MAC 格式不正確'
+}
+
+write_attr() {
+    local path=$1 value=$2
+    printf '%s' "$value" >"$path"
+}
+
+ensure_link() {
+    local target=$1 link=$2
+    if [[ -L "$link" ]]; then
+        [[ $(readlink -- "$link") == "$target" ]] || die "既有 symlink 目標不符：$link"
+    elif [[ -e "$link" ]]; then
+        die "既有路徑不是 symlink：$link"
+    else
+        ln -s -- "$target" "$link"
+    fi
+}
+
+ensure_configfs() {
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        mkdir -p "$configfs_root/usb_gadget"
+        return
+    fi
+    [[ -d "$configfs_root" ]] || die '核心沒有 /sys/kernel/config'
+    if [[ ! -d "$configfs_root/usb_gadget" ]]; then
+        if ! grep -qsE '[[:space:]]/sys/kernel/config[[:space:]]+configfs[[:space:]]' /proc/mounts; then
+            mount -t configfs configfs "$configfs_root"
+        fi
+    fi
+    [[ -d "$configfs_root/usb_gadget" ]] || die 'configfs 沒有 usb_gadget subsystem'
+}
+
+find_udc() {
+    local candidate name resolved selected= seen=0
+    [[ -d "$udc_root" && ! -L "$udc_root" ]] || die '找不到安全的 /sys/class/udc'
+    path_has_no_symlink "$udc_root" || die '/sys/class/udc 根目錄含 symlink'
+    while IFS= read -r -d '' candidate; do
+        seen=$((seen + 1))
+        ((seen <= MAX_UDC_ENTRIES)) || die "UDC 項目超過安全上限 $MAX_UDC_ENTRIES"
+        name=$(basename -- "$candidate")
+        [[ $name =~ ^[A-Za-z0-9_.:+-]{1,64}$ ]] || die 'UDC 名稱格式不正確'
+        [[ -L "$candidate" ]] || continue
+        resolved=$(realpath -e -- "$candidate") || die 'UDC class entry 無法解析'
+        [[ $resolved == "$sys_root/devices/"* ]] || die 'UDC class entry 逃出 sysfs devices'
+        [[ -d "$resolved" && ! -L "$resolved" ]] || die 'UDC target 不是安全目錄'
+        path_has_no_symlink "$resolved" || die 'UDC target 含 symlink'
+        [[ -n $selected ]] || selected=$name
+    done < <(find "$udc_root" -mindepth 1 -maxdepth 1 -print0)
+    [[ -n $selected ]] || die '沒有可用 UDC；請確認 OTG peripheral role 與 DTS'
+    printf '%s\n' "$selected"
+}
+
+start_gadget() {
+    local udc serial manufacturer product device_mac host_mac
+
+    serial=${USB_DEBUG_SERIAL:-RG40XXV-DEBUG}
+    manufacturer=${USB_DEBUG_MANUFACTURER:-RG40XXV Community}
+    product=${USB_DEBUG_PRODUCT:-RG40XXV USB Debug}
+    device_mac=${USB_DEBUG_DEVICE_MAC:-02:40:00:00:00:01}
+    host_mac=${USB_DEBUG_HOST_MAC:-02:40:00:00:00:02}
+    validate_text serial "$serial"
+    validate_text manufacturer "$manufacturer"
+    validate_text product "$product"
+    validate_mac "$device_mac"
+    validate_mac "$host_mac"
+
+    ensure_configfs
+    udc=$(find_udc)
+    mkdir -p \
+        "$gadget/strings/0x409" \
+        "$gadget/configs/c.1/strings/0x409" \
+        "$gadget/functions/rndis.usb0" \
+        "$gadget/functions/acm.GS0" \
+        "$gadget/os_desc"
+
+    write_attr "$gadget/idVendor" 0x1d6b
+    write_attr "$gadget/idProduct" 0x0104
+    write_attr "$gadget/bcdDevice" 0x0100
+    write_attr "$gadget/bcdUSB" 0x0200
+    write_attr "$gadget/bDeviceClass" 0xEF
+    write_attr "$gadget/bDeviceSubClass" 0x02
+    write_attr "$gadget/bDeviceProtocol" 0x01
+    write_attr "$gadget/strings/0x409/serialnumber" "$serial"
+    write_attr "$gadget/strings/0x409/manufacturer" "$manufacturer"
+    write_attr "$gadget/strings/0x409/product" "$product"
+    write_attr "$gadget/configs/c.1/strings/0x409/configuration" 'RNDIS + CDC ACM debug'
+    write_attr "$gadget/configs/c.1/MaxPower" 250
+    write_attr "$gadget/functions/rndis.usb0/dev_addr" "$device_mac"
+    write_attr "$gadget/functions/rndis.usb0/host_addr" "$host_mac"
+
+    if [[ -d "$gadget/functions/rndis.usb0/os_desc/interface.rndis" ]]; then
+        write_attr "$gadget/functions/rndis.usb0/os_desc/interface.rndis/compatible_id" RNDIS
+        write_attr "$gadget/functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id" 5162001
+    fi
+    write_attr "$gadget/os_desc/use" 1
+    write_attr "$gadget/os_desc/b_vendor_code" 0xcd
+    write_attr "$gadget/os_desc/qw_sign" MSFT100
+
+    ensure_link ../../functions/rndis.usb0 "$gadget/configs/c.1/rndis.usb0"
+    ensure_link ../../functions/acm.GS0 "$gadget/configs/c.1/acm.GS0"
+    ensure_link ../configs/c.1 "$gadget/os_desc/c.1"
+
+    if find "$gadget/functions" -mindepth 1 -maxdepth 1 -type d -name 'mass_storage.*' | grep -q .; then
+        die '安全檢查失敗：gadget 中出現 mass_storage function'
+    fi
+    if [[ -s "$gadget/UDC" ]]; then
+        [[ $(<"$gadget/UDC") == "$udc" ]] || \
+            die 'gadget 已綁定到另一個 UDC；拒絕直接切換'
+    else
+        write_attr "$gadget/UDC" "$udc"
+    fi
+    printf 'USB debug 已綁定 UDC=%s（RNDIS usb0 + CDC ACM ttyGS0）\n' "$udc"
+}
+
+stop_gadget() {
+    if [[ -e "$gadget/UDC" && ! -L "$gadget/UDC" ]]; then
+        write_attr "$gadget/UDC" ''
+        printf 'USB debug 已解除 UDC 綁定；configfs 定義保留供下次使用。\n'
+    else
+        printf 'USB debug 尚未建立。\n'
+    fi
+}
+
+status_gadget() {
+    local bound=none
+    if [[ -f "$gadget/UDC" && ! -L "$gadget/UDC" ]]; then
+        bound=$(<"$gadget/UDC")
+        [[ -n "$bound" ]] || bound=unbound
+    fi
+    printf 'gadget=%s\n' "$gadget"
+    printf 'udc=%s\n' "$bound"
+    printf 'rndis=%s\n' "$([[ -L "$gadget/configs/c.1/rndis.usb0" ]] && printf enabled || printf disabled)"
+    printf 'acm=%s\n' "$([[ -L "$gadget/configs/c.1/acm.GS0" ]] && printf enabled || printf disabled)"
+    printf 'mass_storage=%s\n' "$([[ -d "$gadget/functions" ]] && find "$gadget/functions" -mindepth 1 -maxdepth 1 -type d -name 'mass_storage.*' | grep -q . && printf UNSAFE || printf absent)"
+}
+
+init_paths
+case ${1:-} in
+    start)
+        (($# == 1)) || die 'start 不接受額外參數'
+        start_gadget
+        ;;
+    stop)
+        (($# == 1)) || die 'stop 不接受額外參數'
+        stop_gadget
+        ;;
+    status)
+        (($# == 1)) || die 'status 不接受額外參數'
+        status_gadget
+        ;;
+    *)
+        printf '用法：%s {start|stop|status}\n' "$0" >&2
+        exit 2
+        ;;
+esac

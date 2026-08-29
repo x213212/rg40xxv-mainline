@@ -1,0 +1,27 @@
+This repository carries two licences, because it carries two kinds of work.
+
+## Kernel patches — GPL-2.0-only
+
+`patches/` modifies the Linux kernel. Those changes are a derivative work of the
+kernel and are therefore licensed **GPL-2.0-only**, the same terms as the code
+they patch. The full text is in `LICENSE.GPL-2.0`.
+
+This is not a choice made here: the kernel's licence requires it. If you
+distribute a binary kernel built from these patches, you must also offer the
+corresponding source.
+
+    SPDX-License-Identifier: GPL-2.0-only
+
+## Everything else — MIT
+
+`tools/`, `components/` and `docs/` are original work and are licensed **MIT**;
+the full text is in `LICENSE.MIT`. Individual components may carry their own
+LICENSE file, which governs that component.
+
+    SPDX-License-Identifier: MIT
+
+## Third-party material
+
+See `NOTICE.md` for what this repository deliberately does not contain, and
+`docs/upstream-sources.md` for every external project this port draws on, with
+its licence.

@@ -1,0 +1,280 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rg40xxv.local/schema/netstream-v1.schema.json",
+  "title": "RG40XXV netstream logical settings v1",
+  "description": "Logical interchange schema. The backend persists the equivalent model in the versioned percent-encoded files documented by FORMAT.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "wifi", "hosts"],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "wifi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default_ssid", "profiles"],
+      "properties": {
+        "default_ssid": {
+          "type": "string",
+          "description": "Empty when no profile is selected; otherwise must match exactly one profiles[].ssid."
+        },
+        "profiles": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/wifiProfile"
+          }
+        }
+      }
+    },
+    "hosts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default_name", "items"],
+      "properties": {
+        "default_name": {
+          "type": "string",
+          "description": "Empty when no host is selected; otherwise must match exactly one items[].name."
+        },
+        "items": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/host"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "wifiProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ssid", "security", "hidden", "priority", "secret"],
+      "properties": {
+        "ssid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "The C backend additionally enforces valid control-free UTF-8 and a 32-byte limit. Unique within profiles."
+        },
+        "security": {
+          "enum": ["open", "wpa2-psk", "wpa3-sae"]
+        },
+        "hidden": {
+          "type": "boolean",
+          "default": false
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": -999,
+          "maximum": 999,
+          "default": 0
+        },
+        "secret": {
+          "type": "string",
+          "writeOnly": true,
+          "description": "Never accepted as a command-line argument and never emitted by list output."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "security": {
+                "const": "open"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "secret": {
+                "const": ""
+              }
+            }
+          },
+          "else": {
+            "if": {
+              "properties": {
+                "security": {
+                  "const": "wpa2-psk"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "secret": {
+                  "oneOf": [
+                    {
+                      "minLength": 8,
+                      "maxLength": 63
+                    },
+                    {
+                      "pattern": "^[0-9A-Fa-f]{64}$"
+                    }
+                  ]
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "secret": {
+                  "minLength": 8,
+                  "maxLength": 63
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "address",
+        "paired",
+        "last_used",
+        "resolution",
+        "fps",
+        "bitrate_kbps",
+        "packet_size",
+        "codec",
+        "aspect"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96,
+          "description": "Valid control-free UTF-8, at most 96 bytes, and unique within hosts.items."
+        },
+        "address": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "ipv4"
+            },
+            {
+              "type": "string",
+              "format": "ipv6"
+            },
+            {
+              "type": "string",
+              "format": "hostname",
+              "maxLength": 253
+            }
+          ]
+        },
+        "paired": {
+          "type": "boolean",
+          "default": false
+        },
+        "last_used": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4102444800,
+          "default": 0,
+          "description": "Unix seconds; 0 means never used."
+        },
+        "resolution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["width", "height", "custom"],
+          "properties": {
+            "width": {
+              "type": "integer",
+              "minimum": 160,
+              "maximum": 7680,
+              "default": 640
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 120,
+              "maximum": 4320,
+              "default": 480
+            },
+            "custom": {
+              "type": "boolean",
+              "default": false,
+              "description": "false requires 640x480, 1280x720, 1920x1080, 2560x1440, or 3840x2160."
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "custom": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "anyOf": [
+                  {
+                    "properties": {
+                      "width": { "const": 640 },
+                      "height": { "const": 480 }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "width": { "const": 1280 },
+                      "height": { "const": 720 }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "width": { "const": 1920 },
+                      "height": { "const": 1080 }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "width": { "const": 2560 },
+                      "height": { "const": 1440 }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "width": { "const": 3840 },
+                      "height": { "const": 2160 }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "fps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 240,
+          "default": 60
+        },
+        "bitrate_kbps": {
+          "type": "integer",
+          "minimum": 500,
+          "maximum": 200000,
+          "default": 5000
+        },
+        "packet_size": {
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 1500,
+          "default": 1392
+        },
+        "codec": {
+          "enum": ["H264", "H265", "AV1"],
+          "default": "H264"
+        },
+        "aspect": {
+          "enum": ["fit", "fill", "stretch"],
+          "default": "fit"
+        }
+      }
+    }
+  }
+}

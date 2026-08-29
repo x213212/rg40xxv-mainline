@@ -1,0 +1,52 @@
+#!/bin/sh
+# Refuse to commit key material or card images.
+#
+# Nothing in this project needs a private key: the map is read-only and the
+# collectors use public endpoints. So a key appearing in a commit is always a
+# mistake, and this blocks it by name and by content rather than by memory.
+
+set -e
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -n "$staged" ] || exit 0
+
+fail=0
+
+# 1. Filenames that are key material by convention.
+for path in $staged; do
+    case "$path" in
+        *id_rsa*|*id_dsa*|*id_ecdsa*|*id_ed25519*|*_ed25519*|*.pem|*.key|*.ppk|*.p12|*.pfx|*.jks|.ssh/*|*/.ssh/*|*authorized_keys*|*.env|*.env.*)
+            echo "pre-commit: refusing key-shaped path: $path" >&2
+            fail=1
+            ;;
+    esac
+done
+
+# 2. Card images and dumps: they carry vendor firmware and card contents.
+for path in $staged; do
+    case "$path" in
+        *.img|*.img.*|*.bin|*backup/*|*backups/*)
+            echo "pre-commit: refusing a card image or dump: $path" >&2
+            fail=1
+            ;;
+    esac
+done
+
+# 3. Key and token material inside the staged content.
+for path in $staged; do
+    [ -f "$path" ] || continue
+    if git show ":$path" 2>/dev/null | grep -qaE 'BEGIN (RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY'; then
+        echo "pre-commit: refusing private key material in: $path" >&2
+        fail=1
+    fi
+    if git show ":$path" 2>/dev/null | grep -qaE 'ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[0-9A-Za-z-]{10,}'; then
+        echo "pre-commit: refusing an access token in: $path" >&2
+        fail=1
+    fi
+done
+
+if [ "$fail" -ne 0 ]; then
+    echo "pre-commit: commit aborted. Nothing here should carry a key." >&2
+    exit 1
+fi
+exit 0

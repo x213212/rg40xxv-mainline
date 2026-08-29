@@ -1,0 +1,547 @@
+/*
+ * Historical RG40XX V Shell prototype (not part of build.sh)
+ *
+ * Original SDL2 implementation.  It does not link to or copy the stock
+ * dmenu binary.  SDL2_ttf is loaded at runtime so the same executable can be
+ * smoke-tested on an x86 host while using the target's AArch64 libraries on
+ * the device.
+ */
+#define _POSIX_C_SOURCE 200809L
+#include <SDL.h>
+
+/* SDL2_ttf is present in the target rootfs, but its development header is
+ * not part of the extracted firmware.  The public API only exposes an opaque
+ * font handle, so keep the prototype self-contained. */
+typedef struct _TTF_Font TTF_Font;
+
+#include <dirent.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <limits.h>
+#include <math.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define SCREEN_W 640
+#define SCREEN_H 480
+#define MAX_GAMES 64
+#define NAV_COUNT 6
+
+typedef struct {
+    char title[256];
+    char path[PATH_MAX];
+    char platform[64];
+} Game;
+
+typedef struct {
+    void *handle;
+    int (*Init)(void);
+    void (*Quit)(void);
+    TTF_Font *(*OpenFont)(const char *, int);
+    void (*CloseFont)(TTF_Font *);
+    SDL_Surface *(*RenderUTF8Blended)(TTF_Font *, const char *, SDL_Color);
+    int (*SizeUTF8)(TTF_Font *, const char *, int *, int *);
+    bool ready;
+} TTFApi;
+
+typedef struct {
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+    SDL_Joystick *joystick;
+    TTFApi ttf;
+    TTF_Font *font_small;
+    TTF_Font *font_body;
+    TTF_Font *font_title;
+    char font_path[PATH_MAX];
+    Game games[MAX_GAMES];
+    size_t game_count;
+    int nav;
+    int game;
+    bool running;
+    bool headless;
+    bool fullscreen;
+    unsigned frames;
+    unsigned frame_limit;
+    char screenshot[PATH_MAX];
+    char toast[256];
+    Uint32 toast_until;
+} App;
+
+static const char *nav_labels[NAV_COUNT] = {
+    "最近遊玩", "遊戲庫", "收藏", "串流", "應用程式", "設定"
+};
+
+static const char *demo_titles[] = {
+    "星之卡比：夢之泉物語", "薩爾達傳說：縮小帽", "超級瑪利歐 Advance 4",
+    "洛克人 Zero 3", "惡魔城：曉月圓舞曲", "火焰之紋章：烈火之劍"
+};
+
+static const char *demo_platforms[] = {
+    "Game Boy Advance", "Game Boy Advance", "Game Boy Advance",
+    "Game Boy Advance", "Game Boy Advance", "Game Boy Advance"
+};
+
+static const SDL_Color C_BG = { 7, 16, 31, 255 };
+static const SDL_Color C_PANEL = { 13, 29, 52, 255 };
+static const SDL_Color C_PANEL_2 = { 17, 39, 65, 255 };
+static const SDL_Color C_TEAL = { 57, 222, 193, 255 };
+static const SDL_Color C_TEAL_DARK = { 19, 91, 89, 255 };
+static const SDL_Color C_TEXT = { 235, 244, 249, 255 };
+static const SDL_Color C_MUTED = { 143, 172, 190, 255 };
+static const SDL_Color C_ORANGE = { 255, 183, 77, 255 };
+
+static void set_color(SDL_Renderer *r, SDL_Color c) {
+    SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
+}
+
+static void fill_rect(SDL_Renderer *r, int x, int y, int w, int h, SDL_Color c) {
+    SDL_Rect rect = { x, y, w, h };
+    set_color(r, c);
+    SDL_RenderFillRect(r, &rect);
+}
+
+static void outline_rect(SDL_Renderer *r, int x, int y, int w, int h, SDL_Color c) {
+    SDL_Rect rect = { x, y, w, h };
+    set_color(r, c);
+    SDL_RenderDrawRect(r, &rect);
+}
+
+static bool file_exists(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static void copy_text(char *dst, size_t cap, const char *src) {
+    if (!dst || cap == 0) return;
+    snprintf(dst, cap, "%s", src ? src : "");
+}
+
+static const char *platform_for(const char *name) {
+    const char *dot = strrchr(name, '.');
+    if (!dot) return "應用程式";
+    if (!strcasecmp(dot, ".gba") || !strcasecmp(dot, ".gbc") || !strcasecmp(dot, ".gb")) return "Game Boy";
+    if (!strcasecmp(dot, ".nes") || !strcasecmp(dot, ".fds")) return "Nintendo Entertainment System";
+    if (!strcasecmp(dot, ".sfc") || !strcasecmp(dot, ".smc")) return "Super Famicom";
+    if (!strcasecmp(dot, ".md") || !strcasecmp(dot, ".gen")) return "Mega Drive";
+    if (!strcasecmp(dot, ".zip") || !strcasecmp(dot, ".7z")) return "Arcade / ROM";
+    if (!strcasecmp(dot, ".iso") || !strcasecmp(dot, ".chd")) return "Disc image";
+    return "遊戲";
+}
+
+static bool is_rom(const char *name) {
+    const char *dot = strrchr(name, '.');
+    if (!dot) return false;
+    return !strcasecmp(dot, ".gba") || !strcasecmp(dot, ".gbc") || !strcasecmp(dot, ".gb") ||
+           !strcasecmp(dot, ".nes") || !strcasecmp(dot, ".fds") || !strcasecmp(dot, ".sfc") ||
+           !strcasecmp(dot, ".smc") || !strcasecmp(dot, ".md") || !strcasecmp(dot, ".gen") ||
+           !strcasecmp(dot, ".zip") || !strcasecmp(dot, ".7z") || !strcasecmp(dot, ".iso") ||
+           !strcasecmp(dot, ".chd");
+}
+
+static void add_game(App *app, const char *path, const char *name) {
+    if (app->game_count >= MAX_GAMES || !path || !name) return;
+    Game *g = &app->games[app->game_count++];
+    copy_text(g->path, sizeof(g->path), path);
+    copy_text(g->title, sizeof(g->title), name);
+    copy_text(g->platform, sizeof(g->platform), platform_for(name));
+}
+
+static void scan_dir(App *app, const char *dir) {
+    DIR *dp = opendir(dir);
+    if (!dp) return;
+    struct dirent *entry;
+    while ((entry = readdir(dp)) != NULL && app->game_count < MAX_GAMES) {
+        if (entry->d_name[0] == '.' || !is_rom(entry->d_name)) continue;
+        char path[PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path)) continue;
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        add_game(app, path, entry->d_name);
+    }
+    closedir(dp);
+}
+
+static void load_games(App *app) {
+    const char *dirs = getenv("RG40XXV_ROM_DIRS");
+    if (dirs && *dirs) {
+        char copy[PATH_MAX * 2];
+        copy_text(copy, sizeof(copy), dirs);
+        char *save = NULL;
+        for (char *part = strtok_r(copy, ":", &save); part; part = strtok_r(NULL, ":", &save)) {
+            scan_dir(app, part);
+        }
+    } else {
+        scan_dir(app, "/mnt/mmc/Roms");
+        scan_dir(app, "/mnt/sdcard/Roms");
+    }
+    if (app->game_count == 0) {
+        size_t demos = sizeof(demo_titles) / sizeof(demo_titles[0]);
+        for (size_t i = 0; i < demos; ++i) add_game(app, "", demo_titles[i]);
+        for (size_t i = 0; i < app->game_count; ++i) copy_text(app->games[i].platform, sizeof(app->games[i].platform), demo_platforms[i]);
+    }
+}
+
+static void *load_symbol(void *handle, const char *name) {
+    dlerror();
+    void *symbol = dlsym(handle, name);
+    return symbol;
+}
+
+static bool load_ttf(App *app) {
+    const char *libs[] = { "libSDL2_ttf-2.0.so.0", "libSDL2_ttf.so", NULL };
+    for (size_t i = 0; libs[i]; ++i) {
+        app->ttf.handle = dlopen(libs[i], RTLD_NOW | RTLD_LOCAL);
+        if (app->ttf.handle) break;
+    }
+    if (!app->ttf.handle) return false;
+    app->ttf.Init = (int (*)(void))load_symbol(app->ttf.handle, "TTF_Init");
+    app->ttf.Quit = (void (*)(void))load_symbol(app->ttf.handle, "TTF_Quit");
+    app->ttf.OpenFont = (TTF_Font *(*)(const char *, int))load_symbol(app->ttf.handle, "TTF_OpenFont");
+    app->ttf.CloseFont = (void (*)(TTF_Font *))load_symbol(app->ttf.handle, "TTF_CloseFont");
+    app->ttf.RenderUTF8Blended = (SDL_Surface *(*)(TTF_Font *, const char *, SDL_Color))load_symbol(app->ttf.handle, "TTF_RenderUTF8_Blended");
+    app->ttf.SizeUTF8 = (int (*)(TTF_Font *, const char *, int *, int *))load_symbol(app->ttf.handle, "TTF_SizeUTF8");
+    if (!app->ttf.Init || !app->ttf.Quit || !app->ttf.OpenFont || !app->ttf.CloseFont ||
+        !app->ttf.RenderUTF8Blended || !app->ttf.SizeUTF8 || app->ttf.Init() != 0) {
+        dlclose(app->ttf.handle);
+        memset(&app->ttf, 0, sizeof(app->ttf));
+        return false;
+    }
+    app->ttf.ready = true;
+    return true;
+}
+
+static const char *find_font(void) {
+    const char *env = getenv("RG40XXV_FONT");
+    if (env && file_exists(env)) return env;
+    const char *candidates[] = {
+        "/mnt/vendor/bin/default.ttf",
+        "${KERNEL_LAB_ROOT}/firmware/mnt/appfs/bin/default.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        NULL
+    };
+    for (size_t i = 0; candidates[i]; ++i) if (file_exists(candidates[i])) return candidates[i];
+    return NULL;
+}
+
+static bool open_fonts(App *app) {
+    const char *font = find_font();
+    if (!font || !load_ttf(app)) return false;
+    copy_text(app->font_path, sizeof(app->font_path), font);
+    app->font_small = app->ttf.OpenFont(font, 14);
+    app->font_body = app->ttf.OpenFont(font, 18);
+    app->font_title = app->ttf.OpenFont(font, 28);
+    if (!app->font_small || !app->font_body || !app->font_title) return false;
+    return true;
+}
+
+static void draw_fallback(SDL_Renderer *r, int x, int y, const char *text, int scale, SDL_Color color) {
+    /* Tiny 5x7 fallback: enough for host smoke when SDL2_ttf is unavailable. */
+    static const unsigned char glyphs[16][5] = {
+        {0x1e,0x11,0x11,0x11,0x1e}, {0x04,0x0c,0x04,0x04,0x0e},
+        {0x1e,0x01,0x1e,0x10,0x1f}, {0x1e,0x01,0x0e,0x01,0x1e},
+        {0x12,0x12,0x1f,0x02,0x02}, {0x1f,0x10,0x1e,0x01,0x1e},
+        {0x0e,0x10,0x1e,0x11,0x0e}, {0x1f,0x01,0x02,0x04,0x04},
+        {0x0e,0x11,0x0e,0x11,0x0e}, {0x0e,0x11,0x0f,0x01,0x0e},
+        {0x00,0x04,0x00,0x04,0x00}, {0x00,0x00,0x1f,0x00,0x00},
+        {0x04,0x0a,0x11,0x00,0x00}, {0x00,0x00,0x00,0x00,0x00},
+        {0x1f,0x11,0x15,0x11,0x1f}, {0x04,0x0e,0x15,0x04,0x04}
+    };
+    set_color(r, color);
+    int cursor = x;
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+        unsigned idx = 13;
+        if (*p >= '0' && *p <= '9') idx = (unsigned)(*p - '0');
+        else if (*p == ':') idx = 10;
+        else if (*p == '-') idx = 11;
+        else if (*p == '?') idx = 12;
+        else if (*p >= 'A' && *p <= 'O') idx = 14;
+        for (int row = 0; row < 5; ++row) {
+            for (int col = 0; col < 5; ++col) {
+                if (glyphs[idx][col] & (1u << row)) fill_rect(r, cursor + col * scale, y + row * scale, scale, scale, color);
+            }
+        }
+        cursor += 6 * scale;
+    }
+}
+
+static void draw_text(App *app, int x, int y, const char *text, int size, SDL_Color color) {
+    TTF_Font *font = size >= 26 ? app->font_title : (size >= 18 ? app->font_body : app->font_small);
+    if (!font || !app->ttf.ready) {
+        draw_fallback(app->renderer, x, y, text, size >= 24 ? 3 : (size >= 18 ? 2 : 1), color);
+        return;
+    }
+    SDL_Surface *surface = app->ttf.RenderUTF8Blended(font, text, color);
+    if (!surface) return;
+    SDL_Texture *texture = SDL_CreateTextureFromSurface(app->renderer, surface);
+    if (texture) {
+        SDL_Rect dst = { x, y, surface->w, surface->h };
+        SDL_RenderCopy(app->renderer, texture, NULL, &dst);
+        SDL_DestroyTexture(texture);
+    }
+    SDL_FreeSurface(surface);
+}
+
+static int text_width(App *app, const char *text, int size) {
+    TTF_Font *font = size >= 26 ? app->font_title : (size >= 18 ? app->font_body : app->font_small);
+    int w = 0, h = 0;
+    if (font && app->ttf.ready && app->ttf.SizeUTF8(font, text, &w, &h) == 0) return w;
+    return (int)strlen(text) * (size >= 18 ? 12 : 8);
+}
+
+static void center_text(App *app, int cx, int y, const char *text, int size, SDL_Color color) {
+    draw_text(app, cx - text_width(app, text, size) / 2, y, text, size, color);
+}
+
+static void draw_status(App *app, Uint32 now) {
+    fill_rect(app->renderer, 0, 0, SCREEN_W, 40, C_PANEL);
+    fill_rect(app->renderer, 0, 39, SCREEN_W, 1, C_TEAL_DARK);
+    draw_text(app, 18, 11, "RG40XX V", 16, C_TEAL);
+    draw_text(app, 150, 11, "遊戲庫", 16, C_TEXT);
+
+    char clock_text[32];
+    time_t t = time(NULL);
+    struct tm tm_now;
+    localtime_r(&t, &tm_now);
+    strftime(clock_text, sizeof(clock_text), "%H:%M", &tm_now);
+    draw_text(app, 492, 11, clock_text, 16, C_TEXT);
+
+    char battery[32] = "電量 --";
+    FILE *fp = fopen("/sys/class/power_supply/axp2202-battery/capacity", "r");
+    if (fp) {
+        int capacity = 0;
+        if (fscanf(fp, "%d", &capacity) == 1) snprintf(battery, sizeof(battery), "電量 %d%%", capacity);
+        fclose(fp);
+    }
+    draw_text(app, 554, 11, battery, 13, C_MUTED);
+    (void)now;
+}
+
+static void draw_nav(App *app, Uint32 now) {
+    fill_rect(app->renderer, 0, 40, 126, 400, C_PANEL);
+    for (int i = 0; i < NAV_COUNT; ++i) {
+        int y = 58 + i * 55;
+        bool selected = i == app->nav;
+        if (selected) {
+            int pulse = (int)(4.0 * (0.5 + 0.5 * sin((double)now / 220.0)));
+            fill_rect(app->renderer, 9 - pulse / 2, y - 6, 108 + pulse, 40, C_TEAL_DARK);
+            fill_rect(app->renderer, 9, y - 6, 4, 40, C_TEAL);
+        }
+        draw_text(app, 25, y + 5, nav_labels[i], 16, selected ? C_TEXT : C_MUTED);
+    }
+    fill_rect(app->renderer, 0, 405, 126, 1, C_TEAL_DARK);
+    draw_text(app, 20, 418, "離線可用", 13, C_MUTED);
+}
+
+static void draw_game_card(App *app, Uint32 now) {
+    Game *game = &app->games[app->game % (int)app->game_count];
+    fill_rect(app->renderer, 144, 58, 478, 221, C_PANEL_2);
+    outline_rect(app->renderer, 144, 58, 478, 221, C_TEAL_DARK);
+    fill_rect(app->renderer, 160, 74, 178, 178, C_TEAL_DARK);
+    int stripe = (int)(now / 8 % 178);
+    fill_rect(app->renderer, 160 + stripe, 74, 3, 178, C_TEAL);
+    center_text(app, 249, 132, "RG", 42, C_TEAL);
+    center_text(app, 249, 191, "遊戲封面", 14, C_MUTED);
+
+    draw_text(app, 360, 83, game->platform, 14, C_TEAL);
+    draw_text(app, 360, 113, game->title, 24, C_TEXT);
+    draw_text(app, 360, 162, "最近遊玩　 02:14:36", 14, C_MUTED);
+    fill_rect(app->renderer, 360, 210, 128, 34, C_TEAL);
+    draw_text(app, 378, 218, "繼續遊玩", 16, C_BG);
+}
+
+static void draw_game_row(App *app) {
+    int base = app->game;
+    for (int i = -1; i <= 2; ++i) {
+        int idx = (base + i + (int)app->game_count) % (int)app->game_count;
+        int x = 144 + (i + 1) * 120;
+        bool selected = i == 0;
+        fill_rect(app->renderer, x, 298, 108, 88, selected ? C_TEAL_DARK : C_PANEL);
+        outline_rect(app->renderer, x, 298, 108, 88, selected ? C_TEAL : C_TEAL_DARK);
+        draw_text(app, x + 10, 310, app->games[idx].platform, 11, selected ? C_TEAL : C_MUTED);
+        char label[32];
+        snprintf(label, sizeof(label), "遊戲 %d", idx + 1);
+        draw_text(app, x + 10, 337, label, 15, C_TEXT);
+    }
+}
+
+static void draw_bottom(App *app) {
+    fill_rect(app->renderer, 0, 440, SCREEN_W, 40, C_PANEL);
+    fill_rect(app->renderer, 0, 439, SCREEN_W, 1, C_TEAL_DARK);
+    draw_text(app, 20, 452, "A", 16, C_TEAL);
+    draw_text(app, 38, 452, "啟動", 13, C_TEXT);
+    draw_text(app, 105, 452, "B", 16, C_ORANGE);
+    draw_text(app, 123, 452, "返回", 13, C_TEXT);
+    draw_text(app, 190, 452, "X", 16, C_TEAL);
+    draw_text(app, 208, 452, "搜尋", 13, C_TEXT);
+    draw_text(app, 275, 452, "Y", 16, C_ORANGE);
+    draw_text(app, 293, 452, "選單", 13, C_TEXT);
+    if (app->toast[0] && SDL_TICKS_PASSED(app->toast_until, SDL_GetTicks()) == 0) {
+        int w = text_width(app, app->toast, 14) + 24;
+        fill_rect(app->renderer, SCREEN_W - w - 16, 404, w, 28, C_TEAL_DARK);
+        draw_text(app, SCREEN_W - w - 4, 411, app->toast, 14, C_TEXT);
+    }
+}
+
+static void render(App *app, Uint32 now) {
+    set_color(app->renderer, C_BG);
+    SDL_RenderClear(app->renderer);
+    draw_status(app, now);
+    draw_nav(app, now);
+    draw_game_card(app, now);
+    draw_game_row(app);
+    draw_bottom(app);
+    SDL_RenderPresent(app->renderer);
+}
+
+static void toast(App *app, const char *message) {
+    copy_text(app->toast, sizeof(app->toast), message);
+    app->toast_until = SDL_GetTicks() + 2200;
+}
+
+static void launch_selected(App *app) {
+    const char *cmd = getenv("RG40XXV_LAUNCH_CMD");
+    if (!cmd || !*cmd) {
+        toast(app, "啟動器尚未連接");
+        return;
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    if (child > 0) toast(app, "正在啟動遊戲");
+}
+
+static void move_game(App *app, int delta) {
+    if (app->game_count == 0) return;
+    app->game = (app->game + delta + (int)app->game_count) % (int)app->game_count;
+}
+
+static void handle_action(App *app, int action) {
+    /* 0=A, 1=B, 2=X, 3=Y */
+    if (action == 0) launch_selected(app);
+    else if (action == 1) toast(app, "已在首頁");
+    else if (action == 2) toast(app, "搜尋功能即將推出");
+    else if (action == 3) toast(app, "選單功能即將推出");
+}
+
+static void handle_event(App *app, const SDL_Event *event) {
+    if (event->type == SDL_QUIT) {
+        app->running = false;
+    } else if (event->type == SDL_KEYDOWN && event->key.repeat == 0) {
+        SDL_Keycode key = event->key.keysym.sym;
+        if (key == SDLK_ESCAPE || key == SDLK_q) app->running = false;
+        else if (key == SDLK_UP || key == SDLK_w) app->nav = (app->nav + NAV_COUNT - 1) % NAV_COUNT;
+        else if (key == SDLK_DOWN || key == SDLK_s) app->nav = (app->nav + 1) % NAV_COUNT;
+        else if (key == SDLK_LEFT || key == SDLK_a) move_game(app, -1);
+        else if (key == SDLK_RIGHT || key == SDLK_d) move_game(app, 1);
+        else if (key == SDLK_RETURN || key == SDLK_SPACE) handle_action(app, 0);
+        else if (key == SDLK_BACKSPACE) handle_action(app, 1);
+        else if (key == SDLK_x) handle_action(app, 2);
+        else if (key == SDLK_y) handle_action(app, 3);
+    } else if (event->type == SDL_JOYHATMOTION) {
+        if (event->jhat.value & SDL_HAT_UP) app->nav = (app->nav + NAV_COUNT - 1) % NAV_COUNT;
+        if (event->jhat.value & SDL_HAT_DOWN) app->nav = (app->nav + 1) % NAV_COUNT;
+        if (event->jhat.value & SDL_HAT_LEFT) move_game(app, -1);
+        if (event->jhat.value & SDL_HAT_RIGHT) move_game(app, 1);
+    } else if (event->type == SDL_JOYAXISMOTION && event->jaxis.axis <= 1 && abs(event->jaxis.value) > 16000) {
+        if (event->jaxis.axis == 0) move_game(app, event->jaxis.value > 0 ? 1 : -1);
+        else app->nav = (app->nav + (event->jaxis.value > 0 ? 1 : NAV_COUNT - 1)) % NAV_COUNT;
+    } else if (event->type == SDL_JOYBUTTONDOWN) {
+        if (event->jbutton.button <= 3) handle_action(app, event->jbutton.button);
+    }
+}
+
+static void screenshot(App *app, const char *path) {
+    if (!path || !*path) return;
+    SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(0, SCREEN_W, SCREEN_H, 32, SDL_PIXELFORMAT_RGBA32);
+    if (!surface) return;
+    if (SDL_RenderReadPixels(app->renderer, NULL, SDL_PIXELFORMAT_RGBA32, surface->pixels, surface->pitch) == 0) {
+        if (SDL_SaveBMP(surface, path) != 0) fprintf(stderr, "screenshot: %s\n", SDL_GetError());
+    } else {
+        fprintf(stderr, "screenshot readback: %s\n", SDL_GetError());
+    }
+    SDL_FreeSurface(surface);
+}
+
+static void usage(const char *argv0) {
+    printf("Usage: %s [--headless] [--frames N] [--screenshot FILE] [--font FILE] [--fullscreen]\n", argv0);
+}
+
+static bool parse_args(App *app, int argc, char **argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--headless")) app->headless = true;
+        else if (!strcmp(argv[i], "--fullscreen")) app->fullscreen = true;
+        else if (!strcmp(argv[i], "--frames") && i + 1 < argc) app->frame_limit = (unsigned)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) copy_text(app->screenshot, sizeof(app->screenshot), argv[++i]);
+        else if (!strcmp(argv[i], "--font") && i + 1 < argc) setenv("RG40XXV_FONT", argv[++i], 1);
+        else if (!strcmp(argv[i], "--help")) { usage(argv[0]); return false; }
+        else { fprintf(stderr, "Unknown option: %s\n", argv[i]); usage(argv[0]); return false; }
+    }
+    return true;
+}
+
+static void cleanup(App *app) {
+    if (app->font_small) app->ttf.CloseFont(app->font_small);
+    if (app->font_body) app->ttf.CloseFont(app->font_body);
+    if (app->font_title) app->ttf.CloseFont(app->font_title);
+    if (app->ttf.ready) app->ttf.Quit();
+    if (app->ttf.handle) dlclose(app->ttf.handle);
+    if (app->joystick) SDL_JoystickClose(app->joystick);
+    if (app->renderer) SDL_DestroyRenderer(app->renderer);
+    if (app->window) SDL_DestroyWindow(app->window);
+    SDL_Quit();
+}
+
+int main(int argc, char **argv) {
+    App app;
+    memset(&app, 0, sizeof(app));
+    app.running = true;
+    if (!parse_args(&app, argc, argv)) return 0;
+    if (app.headless) {
+        SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
+        SDL_setenv("SDL_RENDER_DRIVER", "software", 1);
+    }
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0) {
+        fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+        return 1;
+    }
+    Uint32 flags = SDL_WINDOW_SHOWN;
+    if (app.fullscreen) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    app.window = SDL_CreateWindow("RG40XX V Shell", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                  SCREEN_W, SCREEN_H, flags);
+    if (!app.window) { fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); cleanup(&app); return 1; }
+    app.renderer = SDL_CreateRenderer(app.window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!app.renderer) app.renderer = SDL_CreateRenderer(app.window, -1, SDL_RENDERER_SOFTWARE);
+    if (!app.renderer) { fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError()); cleanup(&app); return 1; }
+    SDL_RenderSetLogicalSize(app.renderer, SCREEN_W, SCREEN_H);
+    if (SDL_NumJoysticks() > 0) app.joystick = SDL_JoystickOpen(0);
+    if (!open_fonts(&app)) fprintf(stderr, "warning: SDL2_ttf/font unavailable; using smoke fallback\n");
+    load_games(&app);
+    Uint32 last = SDL_GetTicks();
+    unsigned frames = 0;
+    while (app.running && (!app.frame_limit || frames < app.frame_limit)) {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) handle_event(&app, &event);
+        Uint32 now = SDL_GetTicks();
+        render(&app, now);
+        ++frames;
+        if (app.screenshot[0] && frames == 1) screenshot(&app, app.screenshot);
+        Uint32 elapsed = now - last;
+        if (elapsed < 16) SDL_Delay(16 - elapsed);
+        last = now;
+    }
+    cleanup(&app);
+    return 0;
+}

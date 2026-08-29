@@ -1,0 +1,15 @@
+[Unit]
+Description=RG40XXV NetworkManager readiness and Wi-Fi stability policy
+Documentation=file:/usr/share/doc/rg40xxv-device-control/README-zh-TW.md
+Wants=dbus.service NetworkManager.service
+After=dbus.service NetworkManager.service
+Before=network-online.target rg40xxv-time-sync.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/rg40xxv-network-control prepare
+RemainAfterExit=yes
+TimeoutStartSec=45s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() {
+    printf 'save-guard: %s\n' "$*" >&2
+    exit 1
+}
+
+init_root() {
+    root_prefix=
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        test_root=${DEVICE_CONTROL_TEST_ROOT:-}
+        [[ "$test_root" == /tmp/rg40xxv-device-control-test.* ]] || \
+            die '測試根目錄不符合固定 /tmp 前綴'
+        [[ -d "$test_root/rootfs" && ! -L "$test_root/rootfs" ]] || \
+            die '無效測試 rootfs'
+        root_prefix="$test_root/rootfs"
+    fi
+    state_dir="${root_prefix}/var/lib/rg40xxv/save-guard"
+    backup_dir="$state_dir/backups"
+}
+
+logical_to_actual() {
+    printf '%s%s' "$root_prefix" "$1"
+}
+
+actual_to_relative() {
+    local actual=$1
+    if [[ -n "$root_prefix" ]]; then
+        [[ "$actual" == "$root_prefix/"* ]] || die '掃描路徑逃出測試 rootfs'
+        printf '%s' "${actual#"$root_prefix/"}"
+    else
+        [[ "$actual" == /* ]] || die '來源不是絕對路徑'
+        printf '%s' "${actual#/}"
+    fi
+}
+
+add_exact_root() {
+    local logical=$1 actual
+    actual=$(logical_to_actual "$logical")
+    if [[ -d "$actual" && ! -L "$actual" ]]; then
+        printf '%s\0' "$actual" >>"$ROOTS_RAW"
+    fi
+}
+
+discover_roots() {
+    local logical actual
+
+    ROOTS_RAW=$(mktemp "$state_dir/.roots.raw.XXXXXX")
+    ROOTS_SORTED=$(mktemp "$state_dir/.roots.sorted.XXXXXX")
+    ENTRIES_RAW=$(mktemp "$state_dir/.entries.raw.XXXXXX")
+    ENTRY_LIST=$(mktemp "$state_dir/.entries.XXXXXX")
+    : >"$ROOTS_RAW"
+    : >"$ENTRIES_RAW"
+
+    for logical in \
+        /.config/retroarch/saves \
+        /.config/retroarch/states \
+        /mnt/mmc/Saves \
+        /mnt/mmc/.config/retroarch/saves \
+        /mnt/mmc/.config/retroarch/states \
+        /mnt/sdcard/.config/retroarch/saves \
+        /mnt/sdcard/.config/retroarch/states \
+        /mnt/data/retroarch/saves \
+        /mnt/data/retroarch/states \
+		/mnt/data/rg40xxv/state/aarch64-retroarch/saves \
+		/mnt/data/rg40xxv/state/aarch64-retroarch/states \
+        /mnt/mmc/PSP/SAVEDATA \
+        /mnt/mmc/PSP/PPSSPP_STATE \
+        /mnt/mmc/.config/ppsspp/PSP/SAVEDATA \
+        /mnt/mmc/.config/ppsspp/PSP/PPSSPP_STATE \
+        /mnt/mmc/.config/ppsspp/PSP/SCREENSHOT \
+        /mnt/mmc/.config/ppsspp/PSP/Cheats \
+        /mnt/mmc/Saves/PSP \
+        /mnt/sdcard/PSP/SAVEDATA \
+        /mnt/sdcard/PSP/PPSSPP_STATE \
+        /mnt/sdcard/.config/ppsspp/PSP/SAVEDATA \
+        /mnt/sdcard/.config/ppsspp/PSP/PPSSPP_STATE \
+        /mnt/sdcard/.config/ppsspp/PSP/SCREENSHOT \
+        /mnt/sdcard/.config/ppsspp/PSP/Cheats \
+        /mnt/sdcard/Saves/PSP \
+        /mnt/data/ppsspp/PSP/SAVEDATA \
+        /mnt/data/ppsspp/PSP/PPSSPP_STATE \
+        /mnt/data/rg40xxv/state/home/.config/ppsspp/PSP/SAVEDATA \
+        /mnt/data/rg40xxv/state/home/.config/ppsspp/PSP/PPSSPP_STATE \
+        /mnt/data/rg40xxv/state/home/.config/ppsspp/PSP/SCREENSHOT \
+        /mnt/data/rg40xxv/state/home/.config/ppsspp/PSP/Cheats \
+        /mnt/mmc/Emus/nds/backup \
+        /mnt/mmc/Emus/nds/savestates \
+        /mnt/mmc/save_nds/backup \
+        /mnt/mmc/save_nds/savestates \
+        /mnt/mmc/Saves/NDS \
+        /mnt/sdcard/Emus/nds/backup \
+        /mnt/sdcard/Emus/nds/savestates \
+        /mnt/sdcard/save_nds/backup \
+        /mnt/sdcard/save_nds/savestates \
+        /mnt/sdcard/Saves/NDS \
+        /mnt/data/drastic/backup \
+        /mnt/data/drastic/savestates \
+        /mnt/vendor/deep/drastic-modify/res/backup \
+        /mnt/vendor/deep/drastic-modify/res/savestates \
+        /mnt/mmc/save_flycast/.local/share/flycast \
+        /mnt/sdcard/save_flycast/.local/share/flycast; do
+        add_exact_root "$logical"
+    done
+
+    for logical in \
+        /mnt/mmc/Roms \
+        /mnt/mmc/roms \
+        /mnt/sdcard/Roms \
+        /mnt/sdcard/roms; do
+        actual=$(logical_to_actual "$logical")
+        if [[ -d "$actual" && ! -L "$actual" ]]; then
+            find -P "$actual" -xdev -mindepth 2 -maxdepth 5 -type d \
+                \( -name savedata -o -name Saves -o -name saves -o \
+                   -name Save -o -name SAVEDATA \) -print0 >>"$ROOTS_RAW"
+            # Stock RetroArch enables both *_in_content_dir and sort_*.
+            # That produces paths such as Roms/GBA/mGBA/game.srm rather than
+            # placing every save under a directory literally named Saves.
+            # Match only known save/state sidecars so a backup never expands
+            # into the ROM collection or relies on an incomplete core-name
+            # allowlist.  -P and -xdev are intentional: do not follow links or
+            # cross from a ROM filesystem into another mount.
+            find -P "$actual" -xdev -mindepth 2 -type f \
+                \( -iname '*.srm' -o -iname '*.sav' -o -iname '*.dsv' -o \
+                   -iname '*.rtc' -o -iname '*.eep' -o -iname '*.fla' -o \
+                   -iname '*.sra' -o -iname '*.mpk' -o -iname '*.mcr' -o \
+                   -iname '*.mcd' -o -iname '*.ps2' -o -iname '*.state' -o \
+                   -iname '*.state.auto' -o -iname '*.state[0-9]*' -o \
+                   -iname '*.pure.zip' -o -iname 'save[0-9]*.lsd' \) \
+                -print0 >>"$ENTRIES_RAW"
+        fi
+    done
+
+    sort -zu "$ROOTS_RAW" >"$ROOTS_SORTED"
+    while IFS= read -r -d '' actual; do
+        find -P "$actual" -xdev \
+            \( -type d -o -type f -o -type l \) -print0
+    done <"$ROOTS_SORTED" >>"$ENTRIES_RAW"
+    sort -zu "$ENTRIES_RAW" | while IFS= read -r -d '' actual; do
+        printf '%s\0' "$(actual_to_relative "$actual")"
+    done >"$ENTRY_LIST"
+}
+
+encode_base64() {
+    printf '%s' "$1" | base64 -w0
+}
+
+write_manifest() {
+    local destination=$1 relative actual kind mode size mtime digest encoded
+    local tmp
+
+    tmp=$(mktemp "$(dirname -- "$destination")/.manifest.XXXXXX")
+    {
+        printf '# schema=rg40xxv-save-inventory-v1\n'
+        printf '# generated_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'type\tmode\tsize\tmtime_epoch\tsha256\tpath_base64\n'
+        while IFS= read -r -d '' relative; do
+            actual="${root_prefix}/${relative}"
+            if [[ -n "$root_prefix" ]]; then
+                actual="$root_prefix/$relative"
+            else
+                actual="/$relative"
+            fi
+            if [[ -L "$actual" ]]; then
+                kind='symlink'
+                digest=-
+            elif [[ -d "$actual" ]]; then
+                kind='directory'
+                digest=-
+            elif [[ -f "$actual" ]]; then
+                kind='file'
+                digest=$(sha256sum -- "$actual")
+                digest=${digest%% *}
+            else
+                continue
+            fi
+            mode=$(stat -c '%a' -- "$actual")
+            size=$(stat -c '%s' -- "$actual")
+            mtime=$(stat -c '%Y' -- "$actual")
+            encoded=$(encode_base64 "$relative")
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$kind" "$mode" "$size" "$mtime" "$digest" "$encoded"
+        done <"$ENTRY_LIST"
+    } >"$tmp"
+    chmod 0600 "$tmp"
+    mv -f -- "$tmp" "$destination"
+}
+
+cleanup_lists() {
+    local path
+    for path in "${ROOTS_RAW:-}" "${ROOTS_SORTED:-}" \
+        "${ENTRIES_RAW:-}" "${ENTRY_LIST:-}"; do
+        if [[ -n "$path" ]]; then
+            rm -f -- "$path"
+        fi
+    done
+    ROOTS_RAW=
+    ROOTS_SORTED=
+    ENTRIES_RAW=
+    ENTRY_LIST=
+}
+
+inventory() {
+    mkdir -p -- "$state_dir"
+    chmod 0700 "$state_dir"
+    discover_roots
+    trap cleanup_lists RETURN
+    write_manifest "$state_dir/inventory.tsv"
+    printf '%s\n' "$state_dir/inventory.tsv"
+    cleanup_lists
+    trap - RETURN
+}
+
+validate_core_name() {
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ ]] || \
+        die '核心名稱只允許 1–64 個 ASCII 英數、點、底線、加減號'
+}
+
+backup_before_core_switch() {
+    local from=$1 to=$2 stage final stamp sequence=0 archive_tmp
+
+    validate_core_name "$from"
+    validate_core_name "$to"
+    mkdir -p -- "$state_dir" "$backup_dir"
+    chmod 0700 "$state_dir" "$backup_dir"
+    discover_roots
+    trap cleanup_lists RETURN
+    stage=$(mktemp -d "$backup_dir/.backup.XXXXXX")
+    trap 'cleanup_lists; rm -rf -- "$stage"' RETURN
+    write_manifest "$stage/manifest.tsv"
+    {
+        printf 'schema=rg40xxv-save-backup-v1\n'
+        printf 'created_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'from_core=%s\n' "$from"
+        printf 'to_core=%s\n' "$to"
+    } >"$stage/core-switch.txt"
+    chmod 0600 "$stage/core-switch.txt"
+    archive_tmp="$stage/saves.tar.gz.tmp"
+    if [[ -s "$ENTRY_LIST" ]]; then
+        tar -C "${root_prefix:-/}" --null --no-recursion \
+            --files-from="$ENTRY_LIST" -czf "$archive_tmp"
+    else
+        tar -C "$stage" -czf "$archive_tmp" --files-from=/dev/null
+    fi
+    chmod 0600 "$archive_tmp"
+    mv -- "$archive_tmp" "$stage/saves.tar.gz"
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    final="$backup_dir/${stamp}-${from}-to-${to}"
+    while [[ -e "$final" ]]; do
+        ((sequence += 1))
+        final="$backup_dir/${stamp}-${from}-to-${to}-${sequence}"
+    done
+    chmod 0700 "$stage"
+    mv -- "$stage" "$final"
+    cleanup_lists
+    trap - RETURN
+    printf '%s\n' "$final"
+}
+
+init_root
+case ${1:-} in
+    inventory)
+        (($# == 1)) || die 'inventory 不接受路徑或其他參數'
+        inventory
+        ;;
+    backup-before-core-switch)
+        (($# == 5)) || die '需要 --from <核心> --to <核心>'
+        [[ $2 == --from && $4 == --to ]] || die '固定語法為 --from <核心> --to <核心>'
+        backup_before_core_switch "$3" "$5"
+        ;;
+    *)
+        printf '用法：%s inventory\n' "$0" >&2
+        printf '      %s backup-before-core-switch --from <核心> --to <核心>\n' "$0" >&2
+        exit 2
+        ;;
+esac

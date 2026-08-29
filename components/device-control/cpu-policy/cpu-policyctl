@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() {
+    printf 'cpu-policyctl: %s\n' "$*" >&2
+    exit 1
+}
+
+init_paths() {
+    root_prefix=
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        test_root=${DEVICE_CONTROL_TEST_ROOT:-}
+        [[ "$test_root" == /tmp/rg40xxv-device-control-test.* ]] || \
+            die '測試根目錄不符合固定 /tmp 前綴'
+        [[ -d "$test_root/rootfs" && ! -L "$test_root/rootfs" ]] || \
+            die '無效測試 rootfs'
+        root_prefix="$test_root/rootfs"
+    fi
+    cpufreq_root="${root_prefix}/sys/devices/system/cpu/cpufreq"
+    nvmem_root="${root_prefix}/sys/bus/nvmem/devices"
+    run_dir="${root_prefix}/run/rg40xxv/cpu-policy"
+}
+
+discover_policies() {
+    local path name
+    POLICIES=()
+    [[ -d "$cpufreq_root" ]] || die 'cpufreq sysfs 不存在'
+    for path in "$cpufreq_root"/policy*; do
+        [[ -d "$path" && ! -L "$path" ]] || continue
+        name=$(basename -- "$path")
+        [[ $name =~ ^policy[0-9]+$ ]] || continue
+        POLICIES+=("$path")
+    done
+    ((${#POLICIES[@]} > 0)) || die '找不到 cpufreq policy'
+}
+
+word_present() {
+    local needle=$1 word
+    for word in $2; do
+        [[ $word == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+read_policy() {
+    local policy=$1 governors current frequencies value
+    [[ -f "$policy/scaling_available_governors" && ! -L "$policy/scaling_available_governors" ]] || return 1
+    [[ -f "$policy/scaling_governor" && ! -L "$policy/scaling_governor" ]] || return 1
+    [[ -f "$policy/scaling_available_frequencies" && ! -L "$policy/scaling_available_frequencies" ]] || return 1
+    governors=$(<"$policy/scaling_available_governors")
+    current=$(<"$policy/scaling_governor")
+    frequencies=$(<"$policy/scaling_available_frequencies")
+    word_present schedutil "$governors" || return 1
+    word_present performance "$governors" || return 1
+    word_present "$current" "$governors" || return 1
+    for value in $frequencies; do
+        [[ $value =~ ^[0-9]{5,10}$ ]] || return 1
+    done
+    [[ -n "$frequencies" ]] || return 1
+    printf '%s\t%s\t%s\n' "$current" "$governors" "$frequencies"
+}
+
+efuse_status() {
+    local directory name
+    [[ -d "$nvmem_root" ]] || { printf 'not-exposed'; return; }
+    for directory in "$nvmem_root"/*; do
+        [[ -d "$directory" ]] || continue
+        name=$(basename -- "$directory")
+        case "$name" in
+            *efuse*|*sid*|*SID*)
+                [[ -e "$directory/nvmem" ]] && { printf 'exposed-not-read'; return; }
+                ;;
+        esac
+    done
+    printf 'not-exposed'
+}
+
+validate_all() {
+    local policy data failed=0
+    discover_policies
+    for policy in "${POLICIES[@]}"; do
+        if data=$(read_policy "$policy"); then
+            printf 'OK %s %s\n' "$(basename -- "$policy")" "${data%%$'\t'*}"
+        else
+            printf 'INVALID %s：缺少 governor 或公開 OPP\n' "$(basename -- "$policy")" >&2
+            failed=1
+        fi
+    done
+    printf 'efuse=%s\n' "$(efuse_status)"
+    ((failed == 0)) || return 1
+}
+
+write_governor() {
+    local policy=$1 governor=$2 name
+    name=$(basename -- "$policy")
+    [[ -f "$policy/scaling_governor" && ! -L "$policy/scaling_governor" && -w "$policy/scaling_governor" ]] || return 1
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 && ${CPU_POLICY_TEST_FAIL_POLICY:-} == "$name" && ${FAIL_USED:-0} == 0 ]]; then
+        FAIL_USED=1
+        return 1
+    fi
+    printf '%s' "$governor" >"$policy/scaling_governor"
+}
+
+set_all_governors() {
+    local governor=$1 policy data available
+    FAIL_USED=0
+    discover_policies
+    for policy in "${POLICIES[@]}"; do
+        data=$(read_policy "$policy") || die "無效 policy：$(basename -- "$policy")"
+        available=${data#*$'\t'}
+        available=${available%%$'\t'*}
+        word_present "$governor" "$available" || die "policy 不支援 $governor"
+    done
+    for policy in "${POLICIES[@]}"; do
+        write_governor "$policy" "$governor" || return 1
+    done
+}
+
+status_all() {
+    local policy data current governors frequencies
+    discover_policies
+    for policy in "${POLICIES[@]}"; do
+        data=$(read_policy "$policy") || die "無效 policy：$(basename -- "$policy")"
+        IFS=$'\t' read -r current governors frequencies <<<"$data"
+        printf '%s governor=%s governors=%s opp_khz=%s\n' \
+            "$(basename -- "$policy")" "$current" "$governors" "$frequencies"
+    done
+    printf 'efuse=%s\n' "$(efuse_status)"
+    printf 'overclock=disabled\n'
+    printf 'cpu_hotplug_writes=disabled\n'
+}
+
+snapshot_governors() {
+    local policy data current
+    SNAPSHOT=$(mktemp "$run_dir/.governors.XXXXXX")
+    for policy in "${POLICIES[@]}"; do
+        data=$(read_policy "$policy") || return 1
+        current=${data%%$'\t'*}
+        printf '%s\t%s\n' "$(basename -- "$policy")" "$current" >>"$SNAPSHOT"
+    done
+    chmod 0600 "$SNAPSHOT"
+}
+
+restore_governors() {
+    local name governor policy result=0
+    [[ -f ${SNAPSHOT:-} ]] || return 0
+    CPU_POLICY_TEST_FAIL_POLICY=
+    while IFS=$'\t' read -r name governor; do
+        [[ $name =~ ^policy[0-9]+$ ]] || { result=1; continue; }
+        policy="$cpufreq_root/$name"
+        write_governor "$policy" "$governor" || result=1
+    done <"$SNAPSHOT"
+    rm -f -- "$SNAPSHOT"
+    SNAPSHOT=
+    return "$result"
+}
+
+run_performance() {
+    local child_rc restore_rc=0
+    (($# > 0)) || die 'run-performance 缺少命令'
+    discover_policies
+    snapshot_governors || die '無法建立 governor 快照'
+    restore_on_signal() {
+        local signal_rc=$1
+        trap - HUP INT TERM
+        restore_governors || true
+        exit "$signal_rc"
+    }
+    trap 'restore_on_signal 129' HUP
+    trap 'restore_on_signal 130' INT
+    trap 'restore_on_signal 143' TERM
+    # Arm restoration before the first governor write.  Otherwise a TERM that
+    # lands after policy0 becomes performance but before policy4 is written (or
+    # before these traps were installed) can terminate the wrapper with a
+    # partially switched system and no cleanup.
+    if ! set_all_governors performance; then
+        trap - HUP INT TERM
+        restore_governors || true
+        die '切換 performance 失敗，已嘗試還原'
+    fi
+    set +e
+    "$@"
+    child_rc=$?
+    set -e
+    trap - HUP INT TERM
+    restore_governors || restore_rc=$?
+    ((restore_rc == 0)) || die '遊戲結束但 governor 還原失敗'
+    return "$child_rc"
+}
+
+set_ui_default() {
+    discover_policies
+    snapshot_governors || die '無法建立 governor 快照'
+    if ! set_all_governors schedutil; then
+        restore_governors || true
+        die '設定 schedutil 失敗，已嘗試還原'
+    fi
+    rm -f -- "$SNAPSHOT"
+    SNAPSHOT=
+}
+
+init_paths
+mkdir -p -- "$run_dir"
+chmod 0700 "$run_dir"
+exec 9>"$run_dir/.lock"
+flock -x 9
+SNAPSHOT=
+
+case ${1:-} in
+    validate)
+        (($# == 1)) || die 'validate 不接受額外參數'
+        validate_all
+        ;;
+    status)
+        (($# == 1)) || die 'status 不接受額外參數'
+        status_all
+        ;;
+    ui-default)
+        (($# == 1)) || die 'ui-default 不接受額外參數'
+        set_ui_default
+        printf 'governor=schedutil\n'
+        ;;
+    lock-idle)
+        (($# == 1)) || die 'lock-idle 不接受額外參數'
+        validate_all >/dev/null
+        printf 'governor=unchanged\nfrequency_cap=unchanged\nruntime_idle=delegated-to-kernel\n'
+        ;;
+    run-performance)
+        [[ ${2:-} == -- ]] || die '固定語法為 run-performance -- <命令>'
+        shift 2
+        run_performance "$@"
+        ;;
+    *)
+        printf '用法：%s {validate|status|ui-default|lock-idle}\n' "$0" >&2
+        printf '      %s run-performance -- <命令與參數...>\n' "$0" >&2
+        exit 2
+        ;;
+esac

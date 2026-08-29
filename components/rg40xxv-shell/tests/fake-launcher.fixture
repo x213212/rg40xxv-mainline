@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+: "${LAUNCH_CAPTURE:?}"
+printf '<%s>\n' "$@" >"$LAUNCH_CAPTURE"
+if test "${FAKE_EVENT_MARKER:-0}" = 1; then
+	printf '%s\n' 'FAKE_LAUNCHER STARTED' >&2
+fi
+if test "${FAKE_SLEEP:-0}" = 1; then
+	if test -n "${LAUNCH_LEADER_PID:-}"; then
+		printf '%s\n' "$$" >"$LAUNCH_LEADER_PID"
+	fi
+	exec sleep 30
+fi
+if test "${FAKE_BACKGROUND:-0}" = 1; then
+	: "${LAUNCH_GRANDCHILD_PID:?}"
+	sleep 30 </dev/null >/dev/null 2>&1 &
+	printf '%s\n' "$!" >"$LAUNCH_GRANDCHILD_PID"
+	exit 0
+fi
+exit "${FAKE_EXIT:-0}"

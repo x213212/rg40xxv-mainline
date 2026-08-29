@@ -1,0 +1,20 @@
+[Unit]
+Description=Serial login on RG40XXV USB debug ACM port
+Documentation=file:/usr/share/doc/rg40xxv-device-control/README-zh-TW.md
+Requires=rg40xxv-usb-debug.service
+After=rg40xxv-usb-debug.service
+ConditionPathExists=/dev/ttyGS0
+
+[Service]
+Type=idle
+ExecStart=-/sbin/agetty --keep-baud 115200,38400,9600 ttyGS0 vt100
+Restart=always
+RestartSec=1s
+TTYPath=/dev/ttyGS0
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=no
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,48 @@
+#!/bin/sh
+set -eu
+
+capture="${0}.capture"
+lock="${0}.lock"
+if test "${DEVICE_CONTROL_TESTING+x}" = x ||
+   test "${DEVICE_CONTROL_TEST_ROOT+x}" = x ||
+   test "${LD_PRELOAD+x}" = x ||
+   test "${LD_LIBRARY_PATH+x}" = x; then
+	: >"${0}.env-leak"
+	exit 90
+fi
+if ! mkdir "$lock" 2>/dev/null; then
+	: >"${0}.concurrent"
+	exit 91
+fi
+cleanup_lock()
+{
+	rmdir "$lock" 2>/dev/null || true
+}
+trap cleanup_lock EXIT HUP INT TERM
+{
+	printf '%s\n' BEGIN
+	for argument in "$@"; do
+		printf '<%s>\n' "$argument"
+	done
+	printf '%s\n' END
+} >>"$capture"
+
+if test "${1:-}" = brightness && test "${2:-}" = 13; then
+	exit 7
+fi
+if test "${1:-}" = brightness && test "${2:-}" = 97; then
+	: >"${0}.blocked"
+	while ! test -e "${0}.release"; do
+		sleep 0.01
+	done
+fi
+if test "${1:-}" = brightness && test "${2:-}" = 98; then
+	sleep 30
+	exit 0
+fi
+if test "${1:-}" = brightness && test "${2:-}" = 99; then
+	trap - EXIT HUP INT TERM
+	exec sleep 30
+fi
+sleep 0.05
+exit 0

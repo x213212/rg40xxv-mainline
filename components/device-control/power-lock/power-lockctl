@@ -1,0 +1,800 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SHORT_PRESS_MAX_MS=800
+SHUTDOWN_PROMPT_MS=2500
+SHUTDOWN_ACTION_MS=3000
+UNLOCK_TIMEOUT_MS=1500
+SHUTDOWN_CONFIRM_VISIBLE_MS=400
+MAX_BACKLIGHT_ENTRIES=16
+MAX_LED_ENTRIES=64
+
+die() {
+    printf 'power-lockctl: %s\n' "$*" >&2
+    exit 1
+}
+
+init_paths() {
+    root_prefix=
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        test_root=${DEVICE_CONTROL_TEST_ROOT:-}
+        [[ "$test_root" == /tmp/rg40xxv-device-control-test.* ]] || \
+            die '測試根目錄不符合固定 /tmp 前綴'
+        [[ -d "$test_root/rootfs" && ! -L "$test_root/rootfs" ]] || \
+            die '無效測試 rootfs'
+        root_prefix="$test_root/rootfs"
+    fi
+    sys_root="${root_prefix}/sys"
+    state_dir="${root_prefix}/run/rg40xxv/power-lock"
+    config_dir="${root_prefix}/var/lib/rg40xxv/power-lock"
+    config_file="$config_dir/config.v1"
+    state_file="$state_dir/state.v1"
+    snapshot_file="$state_dir/hardware-snapshot.v1"
+    lock_file="$state_dir/.lock"
+}
+
+monotonic_ms() {
+    local seconds fraction
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        [[ ${POWER_LOCK_FAKE_NOW_MS:-} =~ ^[0-9]{1,16}$ ]] || \
+            die '測試必須提供 POWER_LOCK_FAKE_NOW_MS'
+        printf '%s' "$POWER_LOCK_FAKE_NOW_MS"
+        return
+    fi
+    read -r seconds _ </proc/uptime
+    fraction=${seconds#*.}
+    seconds=${seconds%%.*}
+    fraction="${fraction}000"
+    printf '%d' "$((10#$seconds * 1000 + 10#${fraction:0:3}))"
+}
+
+defaults() {
+    MODE=awake
+    UI_MODE=active
+    POWER_HELD=0
+    POWER_DOWN_MS=0
+    POWER_ORIGIN=awake
+    SHUTDOWN_PROMPT=0
+    SHUTDOWN_PROMPT_AT_MS=0
+    PROMPT_WOKE=0
+    SUPPRESS_UNTIL_UP=0
+    UNLOCK_KEY=none
+    UNLOCK_COUNT=0
+    UNLOCK_LAST_MS=0
+    LAST_ACTION=NONE
+}
+
+load_config() {
+    local key value
+    LOCK_ENABLED=true
+    [[ -f "$config_file" && ! -L "$config_file" ]] || return 0
+    while IFS='=' read -r key value; do
+        case "$key" in
+            version) [[ $value == 1 ]] || die 'config version 不支援' ;;
+            lock_enabled) [[ $value == true || $value == false ]] || die 'config lock_enabled 損壞'; LOCK_ENABLED=$value ;;
+            '') ;;
+            *) die 'config 含未知欄位' ;;
+        esac
+    done <"$config_file"
+}
+
+save_config() {
+    local tmp
+    mkdir -p -- "$config_dir"
+    chmod 0700 "$config_dir"
+    tmp=$(mktemp "$config_dir/.config.XXXXXX")
+    {
+        printf 'version=1\n'
+        printf 'lock_enabled=%s\n' "$LOCK_ENABLED"
+    } >"$tmp"
+    chmod 0600 "$tmp"
+    mv -f -- "$tmp" "$config_file"
+}
+
+valid_mode() {
+    case $1 in
+        awake|light_sleep|screen_off|lock_screen|locking|shutdown_requested) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+load_state() {
+    local key value
+    defaults
+    [[ -f "$state_file" && ! -L "$state_file" ]] || return 0
+    while IFS='=' read -r key value; do
+        case "$key" in
+            mode) valid_mode "$value" || die 'state mode 損壞'; MODE=$value ;;
+            ui_mode) [[ $value == active || $value == paused ]] || die 'state ui_mode 損壞'; UI_MODE=$value ;;
+            power_held) [[ $value == 0 || $value == 1 ]] || die 'state power_held 損壞'; POWER_HELD=$value ;;
+            power_down_ms) [[ $value =~ ^[0-9]{1,16}$ ]] || die 'state power_down_ms 損壞'; POWER_DOWN_MS=$value ;;
+            power_origin) valid_mode "$value" || die 'state power_origin 損壞'; POWER_ORIGIN=$value ;;
+            shutdown_prompt) [[ $value == 0 || $value == 1 ]] || die 'state shutdown_prompt 損壞'; SHUTDOWN_PROMPT=$value ;;
+            shutdown_prompt_at_ms) [[ $value =~ ^[0-9]{1,16}$ ]] || die 'state shutdown_prompt_at_ms 損壞'; SHUTDOWN_PROMPT_AT_MS=$value ;;
+            prompt_woke) [[ $value == 0 || $value == 1 ]] || die 'state prompt_woke 損壞'; PROMPT_WOKE=$value ;;
+            suppress_until_up) [[ $value == 0 || $value == 1 ]] || die 'state suppress 損壞'; SUPPRESS_UNTIL_UP=$value ;;
+            unlock_key) [[ $value =~ ^[A-Z0-9_]{1,16}$ || $value == none ]] || die 'state unlock_key 損壞'; UNLOCK_KEY=$value ;;
+            unlock_count) [[ $value =~ ^[0-3]$ ]] || die 'state unlock_count 損壞'; UNLOCK_COUNT=$value ;;
+            unlock_last_ms) [[ $value =~ ^[0-9]{1,16}$ ]] || die 'state unlock_last_ms 損壞'; UNLOCK_LAST_MS=$value ;;
+            last_action) [[ $value =~ ^[A-Z0-9_]{1,64}$ ]] || die 'state last_action 損壞'; LAST_ACTION=$value ;;
+            version|'') ;;
+            *) die 'state 含未知欄位' ;;
+        esac
+    done <"$state_file"
+}
+
+save_state() {
+    local tmp
+    tmp=$(mktemp "$state_dir/.state.XXXXXX")
+    {
+        printf 'version=1\n'
+        printf 'mode=%s\n' "$MODE"
+        printf 'ui_mode=%s\n' "$UI_MODE"
+        printf 'power_held=%s\n' "$POWER_HELD"
+        printf 'power_down_ms=%s\n' "$POWER_DOWN_MS"
+        printf 'power_origin=%s\n' "$POWER_ORIGIN"
+        printf 'shutdown_prompt=%s\n' "$SHUTDOWN_PROMPT"
+        printf 'shutdown_prompt_at_ms=%s\n' "$SHUTDOWN_PROMPT_AT_MS"
+        printf 'prompt_woke=%s\n' "$PROMPT_WOKE"
+        printf 'suppress_until_up=%s\n' "$SUPPRESS_UNTIL_UP"
+        printf 'unlock_key=%s\n' "$UNLOCK_KEY"
+        printf 'unlock_count=%s\n' "$UNLOCK_COUNT"
+        printf 'unlock_last_ms=%s\n' "$UNLOCK_LAST_MS"
+        printf 'last_action=%s\n' "$LAST_ACTION"
+    } >"$tmp"
+    chmod 0600 "$tmp"
+    mv -f -- "$tmp" "$state_file"
+}
+
+sys_relative() {
+    [[ $1 == "$sys_root/"* ]] || die 'sysfs 路徑逃出固定根目錄'
+    printf '%s' "${1#"$sys_root/"}"
+}
+
+encode_path() {
+    printf '%s' "$1" | base64 -w0
+}
+
+decode_path() {
+    printf '%s' "$1" | base64 -d
+}
+
+valid_device_snapshot_path() {
+    local relative=$1 attribute=$2 component
+    local -a components
+    [[ ${#relative} -le 1024 && $relative == devices/* ]] || return 1
+    IFS=/ read -r -a components <<<"$relative"
+    ((${#components[@]} >= 3 && ${#components[@]} <= 32)) || return 1
+    [[ ${components[0]} == devices ]] || return 1
+    [[ ${components[${#components[@]} - 1]} == "$attribute" ]] || return 1
+    for component in "${components[@]}"; do
+        [[ $component =~ ^[A-Za-z0-9_.:+,@=!~-]{1,128}$ ]] || return 1
+        [[ $component != . && $component != .. ]] || return 1
+    done
+}
+
+valid_snapshot_entry() {
+    local kind=$1 relative=$2
+    case $kind in
+        backlight_brightness|rgb_brightness)
+            valid_device_snapshot_path "$relative" brightness
+            ;;
+        backlight_power)
+            valid_device_snapshot_path "$relative" bl_power
+            ;;
+        gpu_control)
+            [[ $relative == class/drm/card0/device/power/control ]] || \
+                [[ $relative == bus/platform/devices/1800000.gpu/power/control ]] || \
+                [[ $relative == devices/platform/1800000.gpu/power/control ]] || \
+                [[ $relative == devices/platform/soc/1800000.gpu/power/control ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+path_has_no_symlink() {
+    local path=$1 relative component current=$sys_root
+    [[ $path == "$sys_root" || $path == "$sys_root/"* ]] || return 1
+    [[ -d "$sys_root" && ! -L "$sys_root" ]] || return 1
+    relative=${path#"$sys_root"/}
+    IFS=/ read -r -a components <<<"$relative"
+    for component in "${components[@]}"; do
+        [[ -n $component && $component != . && $component != .. ]] || return 1
+        current="$current/$component"
+        [[ ! -L "$current" ]] || return 1
+    done
+}
+
+resolve_class_entry() {
+    local candidate=$1 resolved
+    [[ -L "$candidate" ]] || return 1
+    resolved=$(realpath -e -- "$candidate") || return 1
+    [[ $resolved == "$sys_root/devices/"* ]] || return 1
+    [[ -d "$resolved" && ! -L "$resolved" ]] || return 1
+    path_has_no_symlink "$resolved" || return 1
+    printf '%s' "$resolved"
+}
+
+resolve_device_attribute() {
+    local directory=$1 attribute=$2 path resolved
+    case $attribute in
+        brightness|max_brightness|min_brightness|bl_power) ;;
+        *) return 1 ;;
+    esac
+    [[ $directory == "$sys_root/devices/"* ]] || return 1
+    path_has_no_symlink "$directory" || return 1
+    path="$directory/$attribute"
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    resolved=$(realpath -e -- "$path") || return 1
+    [[ $resolved == "$directory/$attribute" ]] || return 1
+    path_has_no_symlink "$resolved" || return 1
+    printf '%s' "$resolved"
+}
+
+discover_class_entries() {
+    local root=$1 maximum=$2 label=$3 candidate name resolved seen=0
+    DISCOVERED_DIRS=()
+    DISCOVERED_NAMES=()
+    path_has_no_symlink "$root" || die "$label 根目錄含 symlink 或不存在"
+    [[ -d "$root" ]] || die "$label 根目錄不存在"
+    while IFS= read -r -d '' candidate; do
+        seen=$((seen + 1))
+        ((seen <= maximum)) || die "$label 項目超過安全上限 $maximum"
+        name=$(basename -- "$candidate")
+        [[ $name =~ ^[A-Za-z0-9_.:+-]{1,64}$ ]] || die "$label 含不安全名稱"
+        [[ -L "$candidate" ]] || continue
+        resolved=$(resolve_class_entry "$candidate") || \
+            die "$label class entry 未安全落在 sysfs devices 內"
+        DISCOVERED_NAMES+=("$name")
+        DISCOVERED_DIRS+=("$resolved")
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
+}
+
+read_uint_file() {
+    local value
+    [[ -f "$1" && ! -L "$1" ]] || return 1
+    value=$(<"$1")
+    [[ $value =~ ^[0-9]{1,10}$ ]] || return 1
+    printf '%s' "$value"
+}
+
+snapshot_add() {
+    local kind=$1 path=$2 value=$3 relative
+    relative=$(sys_relative "$path")
+    valid_snapshot_entry "$kind" "$relative" || die '拒絕快照未知 sysfs 路徑'
+    printf '%s\t%s\t%s\n' "$kind" "$(encode_path "$relative")" "$value" >>"$SNAPSHOT_TMP"
+}
+
+resolve_snapshot_path() {
+    local kind=$1 relative=$2 path
+    valid_snapshot_entry "$kind" "$relative" || return 1
+    path="$sys_root/$relative"
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    path_has_no_symlink "$path" || return 1
+    [[ $(realpath -e -- "$path") == "$path" ]] || return 1
+    printf '%s' "$path"
+}
+
+prepare_snapshot() {
+    local directory path output_path current maximum name lower_name index found_backlight=0 found_rgb=0 found_gpu=0
+    local -a backlight_entries backlight_names led_entries led_names
+
+    SNAPSHOT_TMP=$(mktemp "$state_dir/.hardware.XXXXXX")
+    printf 'version\t1\t1\n' >"$SNAPSHOT_TMP"
+
+    discover_class_entries "$sys_root/class/backlight" "$MAX_BACKLIGHT_ENTRIES" backlight
+    backlight_entries=("${DISCOVERED_DIRS[@]}")
+    backlight_names=("${DISCOVERED_NAMES[@]}")
+    for index in "${!backlight_entries[@]}"; do
+        directory=${backlight_entries[$index]}
+        name=${backlight_names[$index]}
+        output_path=$(resolve_device_attribute "$directory" brightness) || \
+            die '背光 brightness attribute 不安全'
+        current=$(read_uint_file "$output_path") || die '背光 brightness 不是數字'
+        path=$(resolve_device_attribute "$directory" max_brightness) || \
+            die '背光 max_brightness attribute 不安全'
+        maximum=$(read_uint_file "$path") || die '背光 max_brightness 不是數字'
+        ((current <= maximum)) || die '背光值超出 max_brightness'
+        snapshot_add backlight_brightness "$output_path" "$current"
+        if [[ -e $directory/bl_power || -L $directory/bl_power ]]; then
+            path=$(resolve_device_attribute "$directory" bl_power) || \
+                die '背光 bl_power attribute 不安全'
+            current=$(read_uint_file "$path") || die 'bl_power 不是數字'
+            snapshot_add backlight_power "$path" "$current"
+        fi
+        found_backlight=1
+        break
+    done
+
+    discover_class_entries "$sys_root/class/leds" "$MAX_LED_ENTRIES" LED
+    led_entries=("${DISCOVERED_DIRS[@]}")
+    led_names=("${DISCOVERED_NAMES[@]}")
+    for index in "${!led_entries[@]}"; do
+        directory=${led_entries[$index]}
+        name=${led_names[$index]}
+        lower_name=${name,,}
+        case "$lower_name" in
+            *status*|*power*) continue ;;
+            rgb:kbd_backlight|*joystick*|*stick*|*analog*|rg40xxv:left*|rg40xxv:right*) ;;
+            *) continue ;;
+        esac
+        output_path=$(resolve_device_attribute "$directory" brightness) || \
+            die 'RGB brightness attribute 不安全'
+        current=$(read_uint_file "$output_path") || die 'RGB brightness 不是數字'
+        path=$(resolve_device_attribute "$directory" max_brightness) || \
+            die 'RGB max_brightness attribute 不安全'
+        maximum=$(read_uint_file "$path") || die 'RGB max_brightness 不是數字'
+        ((current <= maximum)) || die 'RGB 值超出 max_brightness'
+        snapshot_add rgb_brightness "$output_path" "$current"
+        found_rgb=1
+    done
+
+    for path in \
+        "$sys_root/class/drm/card0/device/power/control" \
+        "$sys_root/bus/platform/devices/1800000.gpu/power/control" \
+        "$sys_root/devices/platform/1800000.gpu/power/control" \
+        "$sys_root/devices/platform/soc/1800000.gpu/power/control"; do
+        if path_has_no_symlink "$path" && [[ -f "$path" && ! -L "$path" ]]; then
+            current=$(<"$path")
+            [[ $current == auto || $current == on ]] || continue
+            snapshot_add gpu_control "$path" "$current"
+            found_gpu=1
+            break
+        fi
+    done
+
+    ((found_backlight)) || die '找不到可驗證的背光 sysfs'
+    ((found_rgb)) || die '找不到可驗證的 joystick RGB sysfs'
+    ((found_gpu)) || die '找不到可驗證的 GPU runtime PM control'
+    chmod 0600 "$SNAPSHOT_TMP"
+    mv -f -- "$SNAPSHOT_TMP" "$snapshot_file"
+    SNAPSHOT_TMP=
+}
+
+cleanup_snapshot_tmp() {
+    if [[ -n ${SNAPSHOT_TMP:-} && $SNAPSHOT_TMP == "$state_dir/.hardware."* ]]; then
+        rm -f -- "$SNAPSHOT_TMP"
+    fi
+}
+
+write_node() {
+    local kind=$1 path=$2 value=$3 fail_after
+    [[ -f "$path" && ! -L "$path" && -w "$path" ]] || return 1
+    path_has_no_symlink "$path" || return 1
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 && ${POWER_LOCK_TEST_FAIL_STEP:-} == "$kind" ]]; then
+        fail_after=${POWER_LOCK_TEST_FAIL_AFTER:-1}
+        [[ $fail_after =~ ^[1-9][0-9]{0,2}$ ]] || die '測試 fail-after 格式錯誤'
+        FAIL_SEEN=$((FAIL_SEEN + 1))
+        if ((FAIL_SEEN == fail_after)); then
+            return 1
+        fi
+    fi
+    printf '%s' "$value" >"$path"
+}
+
+walk_snapshot() {
+    local requested=$1 callback=$2 kind encoded value relative path
+    [[ -f "$snapshot_file" && ! -L "$snapshot_file" ]] || return 1
+    while IFS=$'\t' read -r kind encoded value; do
+        [[ $kind == version ]] && continue
+        [[ $kind == "$requested" ]] || continue
+        relative=$(decode_path "$encoded") || return 1
+        valid_snapshot_entry "$kind" "$relative" || return 1
+        path=$(resolve_snapshot_path "$kind" "$relative") || return 1
+        "$callback" "$kind" "$path" "$value" || return 1
+    done <"$snapshot_file"
+}
+
+write_off() {
+    local kind=$1 path=$2 _saved=$3 off
+    case "$kind" in
+        gpu_control) off=auto ;;
+        rgb_brightness|backlight_brightness) off=0 ;;
+        backlight_power) off=4 ;;
+        *) return 1 ;;
+    esac
+    write_node "$kind" "$path" "$off"
+}
+
+write_restore() {
+    write_node "$1" "$2" "$3"
+}
+
+outputs_off() {
+    FAIL_SEEN=0
+    walk_snapshot gpu_control write_off || return 1
+    walk_snapshot rgb_brightness write_off || return 1
+    walk_snapshot backlight_power write_off || return 1
+    walk_snapshot backlight_brightness write_off || return 1
+}
+
+outputs_restore() {
+    FAIL_SEEN=0
+    walk_snapshot gpu_control write_restore || return 1
+    walk_snapshot rgb_brightness write_restore || return 1
+    walk_snapshot backlight_brightness write_restore || return 1
+    walk_snapshot backlight_power write_restore || return 1
+}
+
+write_percent() {
+    local kind=$1 output_path=$2 _saved=$3 directory maximum minimum=0 target min_path max_path
+    [[ $kind == "$PERCENT_KIND" ]] || return 1
+    directory=${output_path%/*}
+    max_path=$(resolve_device_attribute "$directory" max_brightness) || return 1
+    maximum=$(read_uint_file "$max_path") || return 1
+    ((maximum > 0)) || return 1
+    target=$(((maximum * PERCENT_VALUE + 50) / 100))
+    if [[ $kind == backlight_brightness ]]; then
+        minimum=1
+        if [[ -e $directory/min_brightness || -L $directory/min_brightness ]]; then
+            min_path=$(resolve_device_attribute "$directory" min_brightness) || return 1
+            minimum=$(read_uint_file "$min_path") || return 1
+            ((minimum <= maximum)) || return 1
+        fi
+        if ((target < minimum)); then target=$minimum; fi
+    elif ((PERCENT_VALUE > 0 && target == 0)); then
+        target=1
+    fi
+    write_node "$kind" "$output_path" "$target"
+}
+
+set_output_percent() {
+    local kind=$1 value=$2 action old_last=$LAST_ACTION
+    [[ $MODE == awake || $MODE == lock_screen ]] || die '關屏或關機狀態拒絕調整輸出百分比'
+    [[ $value =~ ^[0-9]{1,3}$ ]] || die '百分比只接受 0..100'
+    value=$((10#$value))
+    ((value >= 0 && value <= 100)) || die '百分比只接受 0..100'
+    case $kind in
+        backlight_brightness) action=ACTION_BRIGHTNESS_SET ;;
+        rgb_brightness) action=ACTION_JOYSTICK_RGB_SET ;;
+        *) die '未知輸出類型' ;;
+    esac
+
+    prepare_snapshot
+    PERCENT_KIND=$kind
+    PERCENT_VALUE=$value
+    FAIL_SEEN=0
+    if ! walk_snapshot "$kind" write_percent; then
+        POWER_LOCK_TEST_FAIL_STEP=
+        POWER_LOCK_TEST_FAIL_AFTER=
+        outputs_restore >/dev/null 2>&1 || true
+        LAST_ACTION=$old_last
+        save_state
+        return 1
+    fi
+    LAST_ACTION=$action
+    save_state
+    printf '%s percent=%s\n' "$LAST_ACTION" "$value"
+}
+
+hardware_screen_off() {
+    case $MODE in
+        awake|lock_screen) transition_screen_off ;;
+        screen_off|light_sleep|locking) printf 'ACTION_SCREEN_ALREADY_OFF\n' ;;
+        shutdown_requested) die '已進入 orderly shutdown 狀態' ;;
+    esac
+}
+
+hardware_screen_on() {
+    case $MODE in
+        screen_off|locking)
+            if [[ $LOCK_ENABLED == true ]]; then transition_lock_screen; else transition_awake; fi
+            ;;
+        light_sleep) transition_awake ;;
+        awake|lock_screen) printf 'ACTION_SCREEN_ALREADY_ON\n' ;;
+        shutdown_requested) die '已進入 orderly shutdown 狀態' ;;
+    esac
+}
+
+force_off_best_effort() {
+    POWER_LOCK_TEST_FAIL_STEP=
+    outputs_off >/dev/null 2>&1 || true
+}
+
+transition_screen_off() {
+    local old_mode=$MODE old_ui=$UI_MODE target action
+    if [[ $LOCK_ENABLED == true ]]; then
+        target=screen_off
+        action=ACTION_SCREEN_OFF_LOCKED
+    else
+        target=light_sleep
+        action=ACTION_SCREEN_OFF_LIGHT_SLEEP
+    fi
+    prepare_snapshot
+    MODE=locking
+    UI_MODE=paused
+    LAST_ACTION=ACTION_PAUSE_RENDERING
+    save_state
+    if ! outputs_off; then
+        POWER_LOCK_TEST_FAIL_STEP=
+        outputs_restore >/dev/null 2>&1 || true
+        MODE=$old_mode
+        UI_MODE=$old_ui
+        LAST_ACTION=ERROR_HARDWARE_OFF_ROLLED_BACK
+        save_state
+        return 1
+    fi
+    MODE=$target
+    UI_MODE=paused
+    UNLOCK_KEY=none
+    UNLOCK_COUNT=0
+    UNLOCK_LAST_MS=0
+    LAST_ACTION=$action
+    save_state
+    printf '%s\n' "$LAST_ACTION"
+}
+
+transition_lock_screen() {
+    if ! outputs_restore; then
+        force_off_best_effort
+        MODE=screen_off
+        UI_MODE=paused
+        LAST_ACTION=ERROR_WAKE_FAILED_SCREEN_STAYS_OFF
+        save_state
+        return 1
+    fi
+    MODE=lock_screen
+    UI_MODE=active
+    UNLOCK_KEY=none
+    UNLOCK_COUNT=0
+    UNLOCK_LAST_MS=0
+    LAST_ACTION=ACTION_SHOW_LOCK_SCREEN
+    save_state
+    printf '%s\n' "$LAST_ACTION"
+}
+
+transition_awake() {
+    if ! outputs_restore; then
+        force_off_best_effort
+        MODE=light_sleep
+        UI_MODE=paused
+        LAST_ACTION=ERROR_WAKE_FAILED_SCREEN_STAYS_OFF
+        save_state
+        return 1
+    fi
+    MODE=awake
+    UI_MODE=active
+    UNLOCK_KEY=none
+    UNLOCK_COUNT=0
+    UNLOCK_LAST_MS=0
+    LAST_ACTION=ACTION_WAKE_RESTORED
+    save_state
+    printf '%s\n' "$LAST_ACTION"
+}
+
+cancel_shutdown() {
+    if ((PROMPT_WOKE)) && [[ $POWER_ORIGIN == screen_off || $POWER_ORIGIN == light_sleep ]]; then
+        force_off_best_effort
+        MODE=$POWER_ORIGIN
+        UI_MODE=paused
+    else
+        MODE=$POWER_ORIGIN
+        if [[ $MODE == screen_off || $MODE == light_sleep ]]; then UI_MODE=paused; else UI_MODE=active; fi
+    fi
+    SHUTDOWN_PROMPT=0
+    SHUTDOWN_PROMPT_AT_MS=0
+    PROMPT_WOKE=0
+    SUPPRESS_UNTIL_UP=1
+    LAST_ACTION=ACTION_CANCEL_SHUTDOWN
+    save_state
+    printf '%s\n' "$LAST_ACTION"
+}
+
+event_power_down() {
+    local now=$1
+    if ((POWER_HELD)); then
+        printf 'NONE\n'
+        return
+    fi
+    POWER_HELD=1
+    POWER_DOWN_MS=$now
+    POWER_ORIGIN=$MODE
+    SHUTDOWN_PROMPT=0
+    SHUTDOWN_PROMPT_AT_MS=0
+    PROMPT_WOKE=0
+    SUPPRESS_UNTIL_UP=0
+    LAST_ACTION=NONE
+    save_state
+    printf 'NONE\n'
+}
+
+event_power_up() {
+    local now=$1 duration
+    ((POWER_HELD)) || { printf 'NONE\n'; return; }
+    duration=$((now - POWER_DOWN_MS))
+    ((duration >= 0)) || die 'monotonic clock 倒退'
+    POWER_HELD=0
+    if ((SUPPRESS_UNTIL_UP)); then
+        SUPPRESS_UNTIL_UP=0
+        LAST_ACTION=NONE
+        save_state
+        printf 'NONE\n'
+        return
+    fi
+    if ((SHUTDOWN_PROMPT)); then
+        cancel_shutdown
+        SUPPRESS_UNTIL_UP=0
+        save_state
+        return
+    fi
+    if ((duration > SHORT_PRESS_MAX_MS)); then
+        LAST_ACTION=NONE
+        save_state
+        printf 'NONE\n'
+        return
+    fi
+    case "$MODE" in
+        awake|lock_screen) transition_screen_off ;;
+        light_sleep) transition_awake ;;
+        screen_off|locking)
+            if [[ $LOCK_ENABLED == true ]]; then transition_lock_screen; else transition_awake; fi
+            ;;
+        shutdown_requested) printf 'ACTION_REQUEST_ORDERLY_SHUTDOWN\n' ;;
+    esac
+}
+
+event_tick() {
+    local now=$1 duration
+    ((POWER_HELD)) || { printf 'NONE\n'; return; }
+    ((SUPPRESS_UNTIL_UP)) && { printf 'NONE\n'; return; }
+    duration=$((now - POWER_DOWN_MS))
+    ((duration >= 0)) || die 'monotonic clock 倒退'
+    if ((SHUTDOWN_PROMPT == 0 && duration >= SHUTDOWN_PROMPT_MS)); then
+        if [[ $MODE == screen_off || $MODE == light_sleep ]]; then
+            if [[ $MODE == light_sleep || $LOCK_ENABLED == false ]]; then
+                transition_awake >/dev/null || return 1
+            else
+                transition_lock_screen >/dev/null || return 1
+            fi
+            PROMPT_WOKE=1
+        fi
+        SHUTDOWN_PROMPT=1
+        SHUTDOWN_PROMPT_AT_MS=$now
+        LAST_ACTION=ACTION_SHOW_SHUTDOWN_CONFIRM
+        save_state
+        printf '%s\n' "$LAST_ACTION"
+    elif ((SHUTDOWN_PROMPT == 1 && duration >= SHUTDOWN_ACTION_MS && now - SHUTDOWN_PROMPT_AT_MS >= SHUTDOWN_CONFIRM_VISIBLE_MS)); then
+        MODE=shutdown_requested
+        UI_MODE=active
+        LAST_ACTION=ACTION_REQUEST_ORDERLY_SHUTDOWN
+        save_state
+        printf '%s\n' "$LAST_ACTION"
+    else
+        printf 'NONE\n'
+    fi
+}
+
+ordinary_button() {
+    case $1 in
+        A|B|X|Y|UP|DOWN|LEFT|RIGHT|L1|R1|L2|R2|L3|R3|SELECT|START|MENU) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ignored_button() {
+    case $1 in RESET|VOLUMEUP|VOLUMEDOWN) return 0 ;; *) return 1 ;; esac
+}
+
+event_button() {
+    local button=$1 now=$2 elapsed
+    [[ $button =~ ^[A-Z0-9_]{1,16}$ ]] || die '按鍵名稱格式不正確'
+    if ((SHUTDOWN_PROMPT)) && [[ $button == B ]]; then
+        cancel_shutdown
+        return
+    fi
+    ignored_button "$button" && { printf 'NONE\n'; return; }
+    ordinary_button "$button" || { printf 'NONE\n'; return; }
+    [[ $MODE == lock_screen ]] || { printf 'NONE\n'; return; }
+
+    elapsed=$((now - UNLOCK_LAST_MS))
+    if [[ $UNLOCK_KEY != "$button" ]] || ((UNLOCK_COUNT == 0 || elapsed < 0 || elapsed > UNLOCK_TIMEOUT_MS)); then
+        UNLOCK_KEY=$button
+        UNLOCK_COUNT=1
+    else
+        UNLOCK_COUNT=$((UNLOCK_COUNT + 1))
+    fi
+    UNLOCK_LAST_MS=$now
+    if ((UNLOCK_COUNT >= 3)); then
+        MODE=awake
+        UI_MODE=active
+        UNLOCK_KEY=none
+        UNLOCK_COUNT=0
+        UNLOCK_LAST_MS=0
+        LAST_ACTION=ACTION_UNLOCKED
+    else
+        LAST_ACTION=ACTION_UNLOCK_PROGRESS
+    fi
+    save_state
+    printf '%s\n' "$LAST_ACTION"
+}
+
+print_status() {
+    printf 'mode=%s\n' "$MODE"
+    printf 'locked=%s\n' "$([[ $MODE == screen_off || $MODE == lock_screen || $MODE == locking ]] && printf yes || printf no)"
+    printf 'lock_enabled=%s\n' "$LOCK_ENABLED"
+    printf 'ui=%s\n' "$UI_MODE"
+    printf 'power_held=%s\n' "$POWER_HELD"
+    printf 'shutdown_prompt=%s\n' "$SHUTDOWN_PROMPT"
+    printf 'unlock_key=%s\n' "$UNLOCK_KEY"
+    printf 'unlock_count=%s\n' "$UNLOCK_COUNT"
+    printf 'last_action=%s\n' "$LAST_ACTION"
+    printf 'suspend_to_ram=disabled\n'
+}
+
+init_paths
+SNAPSHOT_TMP=
+trap cleanup_snapshot_tmp EXIT
+mkdir -p -- "$state_dir"
+chmod 0700 "$state_dir"
+exec 9>"$lock_file"
+flock -x 9
+load_config
+load_state
+
+case ${1:-} in
+    status)
+        (($# == 1)) || die 'status 不接受額外參數'
+        print_status
+        ;;
+    event)
+        (($# >= 2 && $# <= 3)) || die 'event 語法錯誤'
+        now=$(monotonic_ms)
+        case $2 in
+            power-down) (($# == 2)) || die 'power-down 不接受參數'; event_power_down "$now" ;;
+            power-up) (($# == 2)) || die 'power-up 不接受參數'; event_power_up "$now" ;;
+            button) (($# == 3)) || die 'button 需要固定按鍵名稱'; event_button "$3" "$now" ;;
+            *) die '未知 event' ;;
+        esac
+        ;;
+    tick)
+        (($# == 1)) || die 'tick 不接受額外參數'
+        event_tick "$(monotonic_ms)"
+        ;;
+    config)
+        case ${2:-} in
+            get)
+                (($# == 3)) || die 'config get 需要 lock-enabled'
+                [[ $3 == lock-enabled ]] || die '未知設定'
+                printf '%s\n' "$LOCK_ENABLED"
+                ;;
+            set)
+                (($# == 4)) || die 'config set 需要 lock-enabled true|false'
+                [[ $3 == lock-enabled ]] || die '未知設定'
+                [[ $4 == true || $4 == false ]] || die 'lock-enabled 只接受 true|false'
+                LOCK_ENABLED=$4
+                save_config
+                printf 'lock_enabled=%s\n' "$LOCK_ENABLED"
+                ;;
+            *) die 'config 只接受 get/set' ;;
+        esac
+        ;;
+    hardware)
+        case ${2:-} in
+            screen-off)
+                (($# == 2)) || die 'hardware screen-off 不接受額外參數'
+                hardware_screen_off
+                ;;
+            screen-on)
+                (($# == 2)) || die 'hardware screen-on 不接受額外參數'
+                hardware_screen_on
+                ;;
+            brightness)
+                (($# == 3)) || die 'hardware brightness 需要 0..100'
+                set_output_percent backlight_brightness "$3"
+                ;;
+            joystick-rgb)
+                (($# == 3)) || die 'hardware joystick-rgb 需要 0..100'
+                set_output_percent rgb_brightness "$3"
+                ;;
+            *) die 'hardware 只接受 screen-off/screen-on/brightness/joystick-rgb' ;;
+        esac
+        ;;
+    *)
+        printf '用法：%s status\n' "$0" >&2
+        printf '      %s event {power-down|power-up|button <按鍵>}\n' "$0" >&2
+        printf '      %s tick\n' "$0" >&2
+        printf '      %s config {get lock-enabled|set lock-enabled true|false}\n' "$0" >&2
+        printf '      %s hardware {screen-off|screen-on|brightness 0..100|joystick-rgb 0..100}\n' "$0" >&2
+        exit 2
+        ;;
+esac

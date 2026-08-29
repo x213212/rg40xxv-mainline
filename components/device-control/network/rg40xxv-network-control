@@ -1,0 +1,587 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SAFE_PATH=/usr/sbin:/usr/bin:/sbin:/bin
+PATH=$SAFE_PATH
+LC_ALL=C
+export PATH LC_ALL
+SNAPSHOT_HEADER=$'RG40XXV_NETWORK_SNAPSHOT\t1'
+WIFI_INTERFACE=wlan0
+HOTSPOT_CONNECTION=rg40xxv-hotspot
+HOTSPOT_SSID=RG40XXV-Hotspot
+MAX_ACCESS_POINTS=32
+MAX_WIFI_PROFILES=64
+WIFI_SDIO_DEVICE=4021000.mmc
+WIFI_SDIO_DRIVER=/sys/bus/platform/drivers/sunxi-mmc
+WIFI_SDIO_RECOVERY_ATTEMPTS=2
+
+die() {
+	printf 'rg40xxv-network-control: %s\n' "$*" >&2
+	exit 1
+}
+
+usage() {
+	printf '%s\n' \
+		"用法：$0 prepare" \
+		"      $0 recover" \
+		"      $0 status" \
+		"      $0 scan" \
+		"      $0 connect BSSID       # 密碼只由 stdin 傳入" \
+		"      $0 disconnect" \
+		"      $0 forget UUID" \
+		"      $0 hotspot {on|off}" >&2
+	exit 2
+}
+
+init_tools() {
+	local test_root
+	root_prefix=
+	testing=0
+	if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+		testing=1
+		test_root=${DEVICE_CONTROL_TEST_ROOT:-}
+		[[ $test_root == /tmp/rg40xxv-device-control-test.* ]] || \
+			die '測試根目錄不符合固定 /tmp 前綴'
+		[[ -d $test_root/rootfs && ! -L $test_root/rootfs ]] || \
+			die '無效測試 rootfs'
+		[[ -d $test_root/mock-bin && ! -L $test_root/mock-bin ]] || \
+			die '無效測試工具目錄'
+		root_prefix=$test_root/rootfs
+		systemctl=$test_root/mock-bin/systemctl
+		nmcli=$test_root/mock-bin/nmcli
+		rfkill=$test_root/mock-bin/rfkill
+		wifi_sdio_control=$test_root/mock-bin/wifi-sdio-control
+		tool_env=(env -i PATH="$SAFE_PATH" LC_ALL=C \
+			DEVICE_CONTROL_TESTING=1 DEVICE_CONTROL_TEST_ROOT="$test_root")
+		wifi_ready_poll_delay=0.01
+		wifi_ready_poll_count=3
+	else
+		systemctl=/usr/bin/systemctl
+		nmcli=/usr/bin/nmcli
+		rfkill=/usr/sbin/rfkill
+		wifi_sdio_control=
+		tool_env=(env -i PATH="$SAFE_PATH" LC_ALL=C)
+		wifi_ready_poll_delay=0.10
+		wifi_ready_poll_count=50
+	fi
+	for tool in "$systemctl" "$nmcli" "$rfkill"; do
+		[[ -f $tool && ! -L $tool && -x $tool ]] || \
+			die "固定工具不可用：$tool"
+	done
+	if ((testing)); then
+		[[ -f $wifi_sdio_control && ! -L $wifi_sdio_control &&
+			-x $wifi_sdio_control ]] ||
+			die '固定 Wi-Fi SDIO 測試工具不可用'
+	fi
+	run_dir=$root_prefix/run/rg40xxv/network
+	if [[ -e $run_dir ]]; then
+		[[ -d $run_dir && ! -L $run_dir ]] || die 'runtime 目錄不安全'
+	else
+		mkdir -p -- "$run_dir"
+	fi
+	chmod 0700 "$run_dir"
+	exec 9>"$run_dir/.lock"
+	flock -x 9
+}
+
+wifi_interface_present() {
+	[[ -e $root_prefix/sys/class/net/$WIFI_INTERFACE ]]
+}
+
+write_wifi_sdio_control() {
+	local operation=$1 control
+
+	control=$root_prefix$WIFI_SDIO_DRIVER/$operation
+
+	case $operation in
+		bind|unbind) ;;
+		*) return 2 ;;
+	esac
+	if ((testing)); then
+		"$wifi_sdio_control" "$operation" "$WIFI_SDIO_DEVICE"
+	else
+		printf '%s\n' "$WIFI_SDIO_DEVICE" >"$control"
+	fi
+}
+
+wait_for_wifi_interface() {
+	local poll
+
+	for ((poll = 0; poll < wifi_ready_poll_count; ++poll)); do
+		wifi_interface_present && return 0
+		sleep "$wifi_ready_poll_delay"
+	done
+	wifi_interface_present
+}
+
+recover_missing_wifi_interface() {
+	local attempt driver=$root_prefix$WIFI_SDIO_DRIVER
+	local device=$root_prefix/sys/bus/platform/devices/$WIFI_SDIO_DEVICE
+
+	wifi_interface_present && return 0
+	[[ -d $driver && ! -L $driver && -e $device &&
+		-f $driver/bind && ! -L $driver/bind && -w $driver/bind &&
+		-f $driver/unbind && ! -L $driver/unbind && -w $driver/unbind ]] ||
+		return 1
+
+	for ((attempt = 1; attempt <= WIFI_SDIO_RECOVERY_ATTEMPTS; ++attempt)); do
+		# The failed non-removable SDIO probe leaves the host driver bound but
+		# wlan0 absent.  Removing the host re-asserts PG18 through
+		# mmc-pwrseq-simple.  Keep reset asserted for a real 250 ms before the
+		# bind path applies the DT's additional 200 ms post-power-on delay.
+		if [[ -e $driver/$WIFI_SDIO_DEVICE ]]; then
+			write_wifi_sdio_control unbind || return 1
+		fi
+		sleep 0.25
+		write_wifi_sdio_control bind || return 1
+		if wait_for_wifi_interface; then
+			printf 'rg40xxv-network-control: Wi-Fi SDIO recovery PASS attempt=%d\n' \
+				"$attempt" >&2
+			return 0
+		fi
+	done
+	printf 'rg40xxv-network-control: Wi-Fi SDIO recovery FAIL attempts=%d\n' \
+		"$WIFI_SDIO_RECOVERY_ATTEMPTS" >&2
+	return 1
+}
+
+valid_bssid() {
+	[[ ${1:-} =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]
+}
+
+normalize_bssid() {
+	local value=${1^^}
+	valid_bssid "$value" || return 1
+	printf '%s' "$value"
+}
+
+valid_uuid() {
+	[[ ${1:-} =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[1-5][[:xdigit:]]{3}-[89ABab][[:xdigit:]]{3}-[[:xdigit:]]{12}$ ]]
+}
+
+valid_plain_text() {
+	local value=$1 maximum=$2 character
+	((${#value} <= maximum)) || return 1
+	for ((index = 0; index < ${#value}; ++index)); do
+		character=${value:index:1}
+		[[ $character != $'\n' && $character != $'\r' && $character != $'\t' ]] || \
+			return 1
+	done
+}
+
+nmcli_split() {
+	local input=$1 character field= escaped=0
+	NMCLI_FIELDS=()
+	for ((index = 0; index < ${#input}; ++index)); do
+		character=${input:index:1}
+		if ((escaped)); then
+			field+=$character
+			escaped=0
+		elif [[ $character == \\ ]]; then
+			escaped=1
+		elif [[ $character == : ]]; then
+			NMCLI_FIELDS+=("$field")
+			field=
+		else
+			field+=$character
+		fi
+	done
+	((escaped == 0)) || return 1
+	NMCLI_FIELDS+=("$field")
+}
+
+percent_encode() {
+	local input=$1 character byte output=
+	for ((index = 0; index < ${#input}; ++index)); do
+		character=${input:index:1}
+		case $character in
+			[a-zA-Z0-9._]) output+=$character ;;
+			*)
+				printf -v byte '%02X' "'$character"
+				output+="%$byte"
+				;;
+		esac
+	done
+	printf '%s' "$output"
+}
+
+profile_value() {
+	local uuid=$1 property=$2
+	"${tool_env[@]}" "$nmcli" --get-values "$property" \
+		connection show uuid "$uuid" 2>/dev/null | sed -n '1p'
+}
+
+wifi_profile_uuids() {
+	local line uuid type count=0
+	while IFS= read -r line; do
+		[[ -n $line ]] || continue
+		nmcli_split "$line" || continue
+		((${#NMCLI_FIELDS[@]} == 2)) || continue
+		uuid=${NMCLI_FIELDS[0]}
+		type=${NMCLI_FIELDS[1]}
+		valid_uuid "$uuid" || continue
+		[[ $type == 802-11-wireless || $type == wifi ]] || continue
+		[[ $(profile_value "$uuid" 802-11-wireless.mode || true) != ap ]] || \
+			continue
+		printf '%s\n' "$uuid"
+		((++count < MAX_WIFI_PROFILES)) || break
+	done < <("${tool_env[@]}" "$nmcli" --terse --escape yes \
+		--fields UUID,TYPE connection show 2>/dev/null || true)
+}
+
+ensure_manager() {
+	"${tool_env[@]}" "$systemctl" unmask NetworkManager.service >/dev/null
+	"${tool_env[@]}" "$systemctl" enable NetworkManager.service >/dev/null
+	"${tool_env[@]}" "$systemctl" reset-failed NetworkManager.service \
+		>/dev/null 2>&1 || true
+	"${tool_env[@]}" "$systemctl" start NetworkManager.service >/dev/null
+	"${tool_env[@]}" "$rfkill" unblock wifi >/dev/null
+	"${tool_env[@]}" "$nmcli" networking on >/dev/null
+	"${tool_env[@]}" "$nmcli" radio wifi on >/dev/null
+	"${tool_env[@]}" "$nmcli" connection reload >/dev/null
+}
+
+apply_saved_policy() {
+	local uuid
+	while IFS= read -r uuid; do
+		valid_uuid "$uuid" || continue
+		"${tool_env[@]}" "$nmcli" connection modify uuid "$uuid" \
+			802-11-wireless.powersave 2 connection.autoconnect yes \
+			connection.autoconnect-retries 0 >/dev/null
+	done < <(wifi_profile_uuids)
+}
+
+active_uuid() {
+	local value
+	value=$("${tool_env[@]}" "$nmcli" --get-values GENERAL.CON-UUID \
+		device show "$WIFI_INTERFACE" 2>/dev/null | sed -n '1p' || true)
+	valid_uuid "$value" && printf '%s' "$value"
+}
+
+collect_known_profiles() {
+	local uuid ssid
+	declare -gA KNOWN_UUID=()
+	while IFS= read -r uuid; do
+		valid_uuid "$uuid" || continue
+		ssid=$(profile_value "$uuid" 802-11-wireless.ssid || true)
+		[[ -n $ssid ]] || continue
+		valid_plain_text "$ssid" 96 || continue
+		[[ -n ${KNOWN_UUID[$ssid]+present} ]] || KNOWN_UUID["$ssid"]=$uuid
+	done < <(wifi_profile_uuids)
+}
+
+wifi_list() {
+	local rescan=$1
+	"${tool_env[@]}" "$nmcli" --wait 15 --terse --escape yes \
+		--fields IN-USE,BSSID,SIGNAL,SECURITY,SSID device wifi list \
+		ifname "$WIFI_INTERFACE" --rescan "$rescan"
+}
+
+build_snapshot() {
+	local rescan=$1 active state radio present=0 enabled=0 connected=0
+	local hotspot=0 connection_mode= connected_bssid=- connected_ssid=- ip=-
+	local hotspot_ssid=- line in_use bssid signal security ssid known uuid
+	local ssid_encoded security_encoded wifi_output= count=0
+	local -a access_lines=()
+
+	state=
+	if wifi_interface_present; then
+		state=$("${tool_env[@]}" "$nmcli" --get-values GENERAL.STATE \
+			device show "$WIFI_INTERFACE" 2>/dev/null | sed -n '1p' || true)
+	fi
+	radio=$("${tool_env[@]}" "$nmcli" radio wifi 2>/dev/null | sed -n '1p' || true)
+	[[ -n $state ]] && present=1
+	[[ $present == 1 && $radio == enabled ]] && enabled=1
+	[[ $present == 1 && $state == 100* ]] && connected=1
+	if [[ $present == 1 ]]; then
+		active=$(active_uuid || true)
+		if [[ -n $active ]]; then
+			connection_mode=$(profile_value "$active" 802-11-wireless.mode || true)
+			if [[ $connection_mode == ap ]]; then
+				hotspot=1
+				hotspot_ssid=$(profile_value "$active" 802-11-wireless.ssid || true)
+				[[ -n $hotspot_ssid ]] || hotspot_ssid=$HOTSPOT_SSID
+			fi
+		fi
+		ip=$("${tool_env[@]}" "$nmcli" --get-values 'IP4.ADDRESS[1]' \
+			device show "$WIFI_INTERFACE" 2>/dev/null | sed -n '1p' || true)
+		[[ -n $ip ]] || ip=-
+		collect_known_profiles
+	else
+		active=
+		ip=-
+		declare -gA KNOWN_UUID=()
+	fi
+	if [[ $present == 0 ]]; then
+		wifi_output=
+	elif ! wifi_output=$(wifi_list "$rescan" 2>/dev/null); then
+		# A status snapshot can truthfully report a missing/down adapter with an
+		# empty AP list.  An explicit scan must surface the nmcli failure so the
+		# UI never turns a failed scan into a successful empty result.
+		[[ $rescan == no ]] || return 1
+		wifi_output=
+	fi
+	mapfile -t access_lines <<<"$wifi_output"
+	for line in "${access_lines[@]}"; do
+		[[ -n $line ]] || continue
+		nmcli_split "$line" || continue
+		((${#NMCLI_FIELDS[@]} == 5)) || continue
+		in_use=${NMCLI_FIELDS[0]}
+		bssid=$(normalize_bssid "${NMCLI_FIELDS[1]}" 2>/dev/null || true)
+		signal=${NMCLI_FIELDS[2]}
+		security=${NMCLI_FIELDS[3]}
+		ssid=${NMCLI_FIELDS[4]}
+		[[ -n $bssid && $signal =~ ^[0-9]{1,3}$ ]] || continue
+		((10#$signal <= 100)) || continue
+		[[ -n $ssid ]] || continue
+		valid_plain_text "$ssid" 96 || continue
+		valid_plain_text "$security" 64 || continue
+		known=0
+		uuid=-
+		if [[ -n ${KNOWN_UUID[$ssid]+present} ]]; then
+			known=1
+			uuid=${KNOWN_UUID[$ssid]}
+		fi
+		if [[ $in_use == \* ]]; then
+			connected_bssid=$bssid
+			connected_ssid=$(percent_encode "$ssid")
+		fi
+		ssid_encoded=$(percent_encode "$ssid")
+		security_encoded=$(percent_encode "$security")
+		printf 'A\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			"$bssid" "$signal" "$security_encoded" "$ssid_encoded" \
+			"$known" "$([[ $in_use == \* ]] && printf 1 || printf 0)" \
+			"$uuid"
+		((++count >= MAX_ACCESS_POINTS)) && break
+	done >"$run_dir/.access-points.$$"
+	if [[ $hotspot_ssid != - ]]; then
+		hotspot_ssid=$(percent_encode "$hotspot_ssid")
+	fi
+	printf '%s\n' "$SNAPSHOT_HEADER"
+	printf 'S\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$present" "$enabled" "$connected" "$hotspot" \
+		"${active:--}" "$connected_bssid" "$connected_ssid" \
+		"$([[ $ip == - ]] && printf %s - || percent_encode "$ip")" \
+		"$hotspot_ssid"
+	if [[ -f $run_dir/.access-points.$$ && ! -L $run_dir/.access-points.$$ ]]; then
+		command cat -- "$run_dir/.access-points.$$"
+		rm -f -- "$run_dir/.access-points.$$"
+	fi
+}
+
+publish_snapshot() {
+	local rescan=$1 temporary
+	temporary=$(mktemp "$run_dir/.snapshot.XXXXXX")
+	chmod 0600 "$temporary"
+	if ! build_snapshot "$rescan" >"$temporary"; then
+		rm -f -- "$temporary" "$run_dir/.access-points.$$"
+		return 1
+	fi
+	mv -f -- "$temporary" "$run_dir/snapshot.v1"
+	command cat -- "$run_dir/snapshot.v1"
+}
+
+find_access_point() {
+	local wanted=$1 line in_use bssid uuid
+	AP_SSID=
+	AP_SECURITY=
+	AP_UUID=
+	collect_known_profiles
+	while IFS= read -r line; do
+		nmcli_split "$line" || continue
+		((${#NMCLI_FIELDS[@]} == 5)) || continue
+		in_use=${NMCLI_FIELDS[0]}
+		bssid=$(normalize_bssid "${NMCLI_FIELDS[1]}" 2>/dev/null || true)
+		[[ $bssid == "$wanted" ]] || continue
+		AP_SECURITY=${NMCLI_FIELDS[3]}
+		AP_SSID=${NMCLI_FIELDS[4]}
+		valid_plain_text "$AP_SSID" 96 || return 1
+		valid_plain_text "$AP_SECURITY" 64 || return 1
+		if [[ -n ${KNOWN_UUID[$AP_SSID]+present} ]]; then
+			uuid=${KNOWN_UUID[$AP_SSID]}
+			valid_uuid "$uuid" || return 1
+			AP_UUID=$uuid
+		fi
+		return 0
+	done < <(wifi_list no)
+	return 1
+}
+
+read_password() {
+	PASSWORD=
+	[[ ! -t 0 ]] || die 'connect 密碼必須由 stdin 傳入'
+	IFS= read -r PASSWORD || true
+	((${#PASSWORD} <= 63)) || die 'Wi-Fi 密碼超過 63 bytes'
+	valid_plain_text "$PASSWORD" 63 || die 'Wi-Fi 密碼含控制字元'
+	local extra
+	if IFS= read -r extra; then
+		die 'Wi-Fi 密碼 stdin 只能有一行'
+	fi
+}
+
+connect_access_point() {
+	local bssid=$1 profile_name profile_id active
+	find_access_point "$bssid" || die '找不到所選 BSSID；請重新掃描'
+	profile_name=rg40xxv-wifi-${bssid//:/}
+	# A failed `nmcli device wifi connect` can leave its newly-created profile
+	# behind with the rejected PSK.  The UI still shows the old scan result and
+	# legitimately sends a corrected password on the next attempt.  Only replace
+	# profiles created under our deterministic name; never delete an arbitrary
+	# administrator-created saved network.
+	if [[ -n $AP_UUID && -n $PASSWORD ]]; then
+		profile_id=$(profile_value "$AP_UUID" connection.id || true)
+		if [[ $profile_id == "$profile_name" ]]; then
+			"${tool_env[@]}" "$nmcli" connection delete uuid "$AP_UUID" \
+				>/dev/null 2>&1 || die '無法移除先前失敗的 Wi-Fi profile'
+			AP_UUID=
+		fi
+	fi
+	if [[ -n $AP_UUID ]]; then
+		"${tool_env[@]}" "$nmcli" --wait 20 connection up uuid "$AP_UUID" \
+			ifname "$WIFI_INTERFACE" >/dev/null
+	else
+		case $AP_SECURITY in
+			''|--|NONE) [[ -z $PASSWORD ]] || die '開放網路不得附帶密碼' ;;
+			*WEP*|*802.1X*|*EAP*) die '目前只支援開放或 WPA-PSK 網路' ;;
+			*) ((${#PASSWORD} >= 8)) || die 'WPA-PSK 密碼至少 8 bytes' ;;
+		esac
+		if [[ -n $PASSWORD ]]; then
+			if ! printf '%s\n' "$PASSWORD" | \
+				"${tool_env[@]}" "$nmcli" --ask --wait 20 \
+				device wifi connect "$bssid" ifname "$WIFI_INTERFACE" \
+				name "$profile_name" >/dev/null; then
+				# NetworkManager may persist the rejected secret even though
+				# activation failed.  Remove only our fixed-name candidate so a
+				# corrected retry cannot be trapped by the stale credential.
+				"${tool_env[@]}" "$nmcli" connection delete id \
+					"$profile_name" >/dev/null 2>&1 || true
+				PASSWORD=
+				die 'Wi-Fi 驗證或連線失敗；已清除失敗的候選 profile'
+			fi
+		else
+			"${tool_env[@]}" "$nmcli" --wait 20 device wifi connect "$bssid" \
+				ifname "$WIFI_INTERFACE" name "$profile_name" >/dev/null
+		fi
+	fi
+	PASSWORD=
+	active=$(active_uuid || true)
+	if [[ -n $active ]]; then
+		"${tool_env[@]}" "$nmcli" connection modify uuid "$active" \
+			802-11-wireless.powersave 2 connection.autoconnect yes \
+			connection.autoconnect-retries 0 >/dev/null
+	fi
+}
+
+forget_profile() {
+	local uuid=$1 type mode
+	valid_uuid "$uuid" || die 'forget 只接受 canonical UUID'
+	type=$(profile_value "$uuid" connection.type || true)
+	[[ $type == 802-11-wireless || $type == wifi ]] || die 'UUID 不是 Wi-Fi profile'
+	mode=$(profile_value "$uuid" 802-11-wireless.mode || true)
+	[[ $mode != ap ]] || die 'hotspot profile 不可由 forget 刪除'
+	"${tool_env[@]}" "$nmcli" connection delete uuid "$uuid" >/dev/null
+}
+
+recover_wifi() {
+	local state uuid
+	local -a profile_uuids=()
+	recover_missing_wifi_interface ||
+		die "找不到 $WIFI_INTERFACE，Wi-Fi SDIO 重置兩次仍失敗"
+	ensure_manager
+	apply_saved_policy
+	state=$("${tool_env[@]}" "$nmcli" --get-values GENERAL.STATE \
+		device show "$WIFI_INTERFACE" 2>/dev/null | sed -n '1p' || true)
+	if [[ $state != 100* ]]; then
+		# Materialize the bounded list before trying it. Breaking a consumer
+		# loop while wifi_profile_uuids is still writing through a process
+		# substitution produces a misleading EPIPE diagnostic on profiles after
+		# the first successful one.
+		mapfile -t profile_uuids < <(wifi_profile_uuids)
+		for uuid in "${profile_uuids[@]}"; do
+			if "${tool_env[@]}" "$nmcli" --wait 12 connection up uuid "$uuid" \
+				ifname "$WIFI_INTERFACE" >/dev/null 2>&1; then
+				break
+			fi
+		done
+	fi
+}
+
+command=${1:-}
+case $command in
+	prepare|recover|status|scan|disconnect)
+		(($# == 1)) || usage
+		;;
+	connect)
+		(($# == 2)) || usage
+		BSSID=$(normalize_bssid "$2" 2>/dev/null || true)
+		[[ -n $BSSID ]] || die 'connect 只接受 canonical BSSID'
+		;;
+	forget)
+		(($# == 2)) || usage
+		valid_uuid "$2" || die 'forget 只接受 canonical UUID'
+		;;
+	hotspot)
+		(($# == 2)) || usage
+		[[ $2 == on || $2 == off ]] || die 'hotspot 只接受 on/off'
+		;;
+	*) usage ;;
+esac
+
+init_tools
+case $command in
+	prepare)
+		recover_missing_wifi_interface ||
+			die "找不到 $WIFI_INTERFACE，Wi-Fi SDIO 重置兩次仍失敗"
+		ensure_manager
+		apply_saved_policy
+		publish_snapshot no
+		;;
+	recover)
+		recover_wifi
+		publish_snapshot no
+		;;
+	status)
+		publish_snapshot no
+		;;
+	scan)
+		# prepare/recover own service and radio policy.  A refresh is deliberately
+		# read-only apart from NetworkManager's requested rescan; restarting or
+		# reloading the manager here can disturb a resident UI/session.
+		publish_snapshot yes
+		;;
+	connect)
+		read_password
+		ensure_manager
+		connect_access_point "$BSSID"
+		publish_snapshot no
+		;;
+	disconnect)
+		ensure_manager
+		"${tool_env[@]}" "$nmcli" device disconnect "$WIFI_INTERFACE" \
+			>/dev/null
+		publish_snapshot no
+		;;
+	forget)
+		ensure_manager
+		forget_profile "$2"
+		publish_snapshot no
+		;;
+	hotspot)
+		ensure_manager
+		if [[ $2 == on ]]; then
+			if "${tool_env[@]}" "$nmcli" connection show id \
+				"$HOTSPOT_CONNECTION" >/dev/null 2>&1; then
+				"${tool_env[@]}" "$nmcli" --wait 20 connection up id \
+					"$HOTSPOT_CONNECTION" ifname "$WIFI_INTERFACE" >/dev/null
+			else
+				"${tool_env[@]}" "$nmcli" --wait 20 device wifi hotspot \
+					ifname "$WIFI_INTERFACE" con-name "$HOTSPOT_CONNECTION" \
+					ssid "$HOTSPOT_SSID" >/dev/null
+			fi
+		else
+			"${tool_env[@]}" "$nmcli" connection down id \
+				"$HOTSPOT_CONNECTION" >/dev/null 2>&1 || true
+		fi
+		publish_snapshot no
+		;;
+esac

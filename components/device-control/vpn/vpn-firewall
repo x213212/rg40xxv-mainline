@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() {
+    printf 'vpn-firewall: %s\n' "$*" >&2
+    exit 1
+}
+
+init_paths() {
+    root_prefix=
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        test_root=${DEVICE_CONTROL_TEST_ROOT:-}
+        [[ "$test_root" == /tmp/rg40xxv-device-control-test.* ]] || die '測試根目錄不符合固定 /tmp 前綴'
+        [[ -d "$test_root/rootfs" && ! -L "$test_root/rootfs" ]] || die '無效測試 rootfs'
+        root_prefix="$test_root/rootfs"
+    fi
+    profiles_dir="${root_prefix}/var/lib/rg40xxv/openvpn/profiles"
+}
+
+valid_ipv4() {
+    local IFS=. octets octet
+    read -r -a octets <<<"$1"
+    ((${#octets[@]} == 4)) || return 1
+    for octet in "${octets[@]}"; do
+        [[ $octet =~ ^[0-9]{1,3}$ ]] || return 1
+        ((10#$octet <= 255)) || return 1
+    done
+}
+
+load_settings() {
+    local name=$1 field value file
+    [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || die 'profile 名稱格式不正確'
+    file="$profiles_dir/$name/settings.v1"
+    [[ -f "$file" && ! -L "$file" ]] || die 'profile settings 不存在'
+    KILL_SWITCH=false ENDPOINT_IP=unset ENDPOINT_PORT=0 ENDPOINT_PROTO=udp TUN_INTERFACE=tun0
+    while IFS='=' read -r field value; do
+        case "$field" in
+            kill_switch) KILL_SWITCH=$value ;;
+            endpoint_ip) ENDPOINT_IP=$value ;;
+            endpoint_port) ENDPOINT_PORT=$value ;;
+            endpoint_proto) ENDPOINT_PROTO=$value ;;
+            tun_interface) TUN_INTERFACE=$value ;;
+        esac
+    done <"$file"
+    [[ $KILL_SWITCH == true || $KILL_SWITCH == false ]] || die 'kill_switch 損壞'
+    [[ $TUN_INTERFACE =~ ^(tun|tap)[0-9]{1,3}$ ]] || die 'tun interface 損壞'
+    [[ $ENDPOINT_PROTO == udp || $ENDPOINT_PROTO == tcp ]] || die 'endpoint proto 損壞'
+    [[ $ENDPOINT_PORT =~ ^[0-9]{1,5}$ ]] || die 'endpoint port 損壞'
+    ((10#$ENDPOINT_PORT <= 65535)) || die 'endpoint port 超界'
+    [[ $ENDPOINT_IP == unset ]] || valid_ipv4 "$ENDPOINT_IP" || die 'endpoint IPv4 損壞'
+}
+
+nft_input() {
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        [[ ${VPN_TEST_NFT_LOG:-} == /tmp/rg40xxv-device-control-test.* ]] || die 'fake nft log 路徑不安全'
+        printf '%s\n' '--- nft transaction ---' >>"$VPN_TEST_NFT_LOG"
+        cat >>"$VPN_TEST_NFT_LOG"
+    else
+        nft -f -
+    fi
+}
+
+remove_table() {
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        printf '%s\n' 'delete table inet rg40xxv_vpn' | nft_input
+    elif nft list table inet rg40xxv_vpn >/dev/null 2>&1; then
+        printf '%s\n' 'delete table inet rg40xxv_vpn' | nft_input
+    fi
+}
+
+apply_rules() {
+    [[ $ENDPOINT_IP != unset && $ENDPOINT_PORT != 0 ]] || die 'kill switch 缺少固定 endpoint'
+    remove_table
+    nft_input <<EOF
+table inet rg40xxv_vpn {
+    chain output {
+        type filter hook output priority -50; policy drop;
+        oifname "lo" accept
+        ip daddr 192.168.0.0/24 accept
+        oifname "$TUN_INTERFACE" accept
+        ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept
+        ip daddr $ENDPOINT_IP $ENDPOINT_PROTO dport $ENDPOINT_PORT accept
+    }
+}
+EOF
+}
+
+init_paths
+(($# == 2)) || die '用法：vpn-firewall apply PROFILE'
+[[ $1 == apply ]] || die '只接受 apply'
+load_settings "$2"
+if [[ $KILL_SWITCH == true ]]; then
+    apply_rules
+    printf 'kill_switch=enabled\nlan_ssh=preserved:192.168.0.0/24\n'
+else
+    remove_table
+    printf 'kill_switch=disabled\n'
+fi

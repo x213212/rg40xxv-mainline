@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() {
+    printf 'debug-logctl: %s\n' "$*" >&2
+    exit 1
+}
+
+init_root() {
+    root_prefix=
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        test_root=${DEVICE_CONTROL_TEST_ROOT:-}
+        [[ "$test_root" == /tmp/rg40xxv-device-control-test.* ]] || \
+            die '測試根目錄不符合固定 /tmp 前綴'
+        [[ -d "$test_root/rootfs" && ! -L "$test_root/rootfs" ]] || \
+            die '無效測試 rootfs'
+        root_prefix="$test_root/rootfs"
+    fi
+    export_dir="${root_prefix}/var/lib/rg40xxv/debug-exports"
+    retained_dir="${root_prefix}/var/lib/rg40xxv/debug-retained"
+}
+
+valid_category() {
+    case $1 in
+        boot|kernel|ui|emulator|streaming|system) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+set_sources() {
+    local category=$1
+    EXPORT_SOURCES=()
+    CLEAR_SOURCES=()
+    case "$category" in
+        boot)
+            EXPORT_SOURCES=(
+                /var/lib/rg40xxv/boot-logs
+                /var/log/rg40xxv/boot
+                /sys/fs/pstore
+                /var/lib/rg40xxv/debug-retained/last-boot-failure.tar.gz
+            )
+            CLEAR_SOURCES=(
+                /var/lib/rg40xxv/boot-logs
+                /var/log/rg40xxv/boot
+            )
+            ;;
+        kernel)
+            EXPORT_SOURCES=(/var/log/kern.log /var/log/rg40xxv/kernel /sys/fs/pstore)
+            CLEAR_SOURCES=(/var/log/kern.log /var/log/rg40xxv/kernel)
+            ;;
+        ui)
+            EXPORT_SOURCES=(/var/log/rg40xxv/ui)
+            CLEAR_SOURCES=(/var/log/rg40xxv/ui)
+            ;;
+        emulator)
+            EXPORT_SOURCES=(/var/log/rg40xxv/emulator)
+            CLEAR_SOURCES=(/var/log/rg40xxv/emulator)
+            ;;
+        streaming)
+            EXPORT_SOURCES=(/var/log/rg40xxv/streaming)
+            CLEAR_SOURCES=(/var/log/rg40xxv/streaming)
+            ;;
+        system)
+            EXPORT_SOURCES=(/var/log/syslog /var/log/rg40xxv/system)
+            CLEAR_SOURCES=(/var/log/syslog /var/log/rg40xxv/system)
+            ;;
+    esac
+}
+
+actual_path() {
+    printf '%s%s' "$root_prefix" "$1"
+}
+
+source_stats() {
+    local source=$1 count=0 bytes=0 value
+
+    if [[ -L "$source" || ! -e "$source" ]]; then
+        printf '0 0'
+        return
+    fi
+    if [[ -f "$source" ]]; then
+        bytes=$(stat -c '%s' -- "$source" 2>/dev/null || printf 0)
+        count=1
+    elif [[ -d "$source" ]]; then
+        while IFS= read -r -d '' value; do
+            count=$((count + 1))
+            bytes=$((bytes + value))
+        done < <(find -P "$source" -xdev -type f -printf '%s\0' 2>/dev/null)
+    fi
+    printf '%d %d' "$count" "$bytes"
+}
+
+status_one() {
+    local category=$1 logical source stats total_count=0 total_bytes=0
+
+    set_sources "$category"
+    for logical in "${EXPORT_SOURCES[@]}"; do
+        source=$(actual_path "$logical")
+        read -r -a stats <<<"$(source_stats "$source")"
+        total_count=$((total_count + stats[0]))
+        total_bytes=$((total_bytes + stats[1]))
+    done
+    printf '%-10s files=%-6d bytes=%d\n' "$category" "$total_count" "$total_bytes"
+}
+
+preserve_last_boot_failure() {
+    local stage archive_tmp logical source name found=0
+
+    mkdir -p -- "$retained_dir"
+    chmod 0700 "$retained_dir"
+    stage=$(mktemp -d "$retained_dir/.last-boot.XXXXXX")
+    archive_tmp="$retained_dir/.last-boot-failure.tar.gz.tmp.$$"
+    trap 'rm -rf -- "$stage"; rm -f -- "$archive_tmp"' RETURN
+    mkdir -p "$stage/pstore" "$stage/boot"
+
+    for logical in \
+        /sys/fs/pstore/console-ramoops-* \
+        /sys/fs/pstore/dmesg-ramoops-* \
+        /var/lib/rg40xxv/boot-logs/last-failure.log \
+        /var/log/rg40xxv/boot/last-failure.log; do
+        source=$(actual_path "$logical")
+        for source in $source; do
+            [[ -f "$source" && ! -L "$source" ]] || continue
+            name=$(basename -- "$source")
+            if [[ "$logical" == /sys/fs/pstore/* ]]; then
+                cp -p -- "$source" "$stage/pstore/$name"
+            else
+                cp -p -- "$source" "$stage/boot/$name"
+            fi
+            found=1
+        done
+    done
+
+    if ((found)); then
+        {
+            printf 'schema=rg40xxv-last-boot-failure-v1\n'
+            printf 'captured_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } >"$stage/metadata.txt"
+        tar -C "$stage" -czf "$archive_tmp" .
+        chmod 0600 "$archive_tmp"
+        mv -f -- "$archive_tmp" "$retained_dir/last-boot-failure.tar.gz"
+    fi
+    rm -rf -- "$stage"
+    trap - RETURN
+}
+
+copy_export_source() {
+    local logical=$1 source destination
+    source=$(actual_path "$logical")
+    [[ -e "$source" && ! -L "$source" ]] || return 0
+    destination="$EXPORT_STAGE/data/${logical#/}"
+    mkdir -p -- "$(dirname -- "$destination")"
+    cp -a -- "$source" "$destination"
+}
+
+export_category() {
+    local category=$1 stamp archive tmp
+
+    set_sources "$category"
+    mkdir -p -- "$export_dir"
+    chmod 0700 "$export_dir"
+    EXPORT_STAGE=$(mktemp -d "$export_dir/.export.XXXXXX")
+    tmp="$export_dir/.archive.tmp.$$"
+    trap 'rm -rf -- "$EXPORT_STAGE"; rm -f -- "$tmp"' RETURN
+    for logical in "${EXPORT_SOURCES[@]}"; do
+        copy_export_source "$logical"
+    done
+    {
+        printf 'schema=rg40xxv-debug-export-v1\n'
+        printf 'category=%s\n' "$category"
+        printf 'exported_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } >"$EXPORT_STAGE/manifest.txt"
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    archive="$export_dir/${stamp}-${category}-$$.tar.gz"
+    tar -C "$EXPORT_STAGE" -czf "$tmp" .
+    chmod 0600 "$tmp"
+    mv -- "$tmp" "$archive"
+    rm -rf -- "$EXPORT_STAGE"
+    trap - RETURN
+    printf '%s\n' "$archive"
+}
+
+clear_path() {
+    local source=$1
+
+    [[ ! -L "$source" ]] || die "拒絕清除 symlink：$source"
+    if [[ -f "$source" ]]; then
+        : >"$source"
+    elif [[ -d "$source" ]]; then
+        find -P "$source" -xdev -type f -exec bash -c \
+            'for file do : >"$file"; done' bash {} +
+    fi
+}
+
+clear_category() {
+    local category=$1 logical source
+
+    preserve_last_boot_failure
+    set_sources "$category"
+    for logical in "${CLEAR_SOURCES[@]}"; do
+        source=$(actual_path "$logical")
+        clear_path "$source"
+    done
+    printf '已清除 %s 白名單日誌；pstore、存檔、網路設定與 SSH keys 未變更。\n' "$category"
+}
+
+init_root
+command=${1:-}
+case "$command" in
+    status)
+        (($# <= 2)) || die 'status 只接受一個分類'
+        category=${2:-all}
+        if [[ "$category" == all ]]; then
+            for category in boot kernel ui emulator streaming system; do
+                status_one "$category"
+            done
+        else
+            valid_category "$category" || die '未知分類'
+            status_one "$category"
+        fi
+        ;;
+    export)
+        (($# == 2)) || die 'export 必須指定一個白名單分類'
+        valid_category "$2" || die '未知分類'
+        export_category "$2"
+        ;;
+    clear)
+        (($# == 2)) || die 'clear 必須指定一個白名單分類'
+        valid_category "$2" || die '未知分類'
+        clear_category "$2"
+        ;;
+    *)
+        printf '用法：%s status [all|boot|kernel|ui|emulator|streaming|system]\n' "$0" >&2
+        printf '      %s export <分類>\n' "$0" >&2
+        printf '      %s clear <分類>\n' "$0" >&2
+        exit 2
+        ;;
+esac

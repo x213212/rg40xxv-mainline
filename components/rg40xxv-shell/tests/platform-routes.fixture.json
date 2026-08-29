@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "platforms": {
+    "GBA": { "label_zh_TW": "Game Boy Advance", "routes": ["libretro:mgba", "aarch64:mgba"] }
+  }
+}
