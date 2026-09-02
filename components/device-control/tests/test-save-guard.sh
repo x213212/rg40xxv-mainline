@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+# Keep failures actionable when this gate runs after the longer emulator
+# integration suite.  ERR inheritance also reports failures originating in a
+# command substitution instead of leaving the build with an unexplained rc=1.
+trap 'rc=$?; printf "FAIL save-guard test: rc=%d line=%s command=%s\n" "$rc" "$LINENO" "$BASH_COMMAND" >&2; exit "$rc"' ERR
 
 TEST_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 ROOT=$(cd -- "$TEST_DIR/.." && pwd)
@@ -45,7 +50,7 @@ mkdir -p \
     "$ROOTFS/mnt/mmc/Roms/DOS/DOSBox-pure" \
     "$ROOTFS/mnt/mmc/Roms/RPG/EasyRPG Player" \
     "$ROOTFS/mnt/mmc/Roms/NDS/melonDS" \
-    "$ROOTFS/mnt/mmc/Roms/PORTS/測試遊戲/savedata" \
+    "$ROOTFS/mnt/mmc/Roms/PORTS/仙劍奇俠傳/savedata" \
     "$ROOTFS/mnt/mmc/Roms/OPENBOR/Chrono Killer/Saves" \
     "$ROOTFS/mnt/sdcard/Roms/GBC/mGBA" \
     "$ROOTFS/mnt/sdcard/Roms/OPENBOR/Final Fight/Saves" \
@@ -88,7 +93,7 @@ printf 'CONTENT-MUPEN-EEP\n' >"$ROOTFS/mnt/mmc/Roms/N64/Mupen64Plus-Next/zelda.e
 printf 'CONTENT-DOSBOX-OVERLAY\n' >"$ROOTFS/mnt/mmc/Roms/DOS/DOSBox-pure/doom.pure.zip"
 printf 'CONTENT-EASYRPG-SAVE\n' >"$ROOTFS/mnt/mmc/Roms/RPG/EasyRPG Player/Save01.lsd"
 printf 'CONTENT-MELONDS-SAVE\n' >"$ROOTFS/mnt/mmc/Roms/NDS/melonDS/pokemon.dsv"
-printf 'PORT-SAVE\n' >"$ROOTFS/mnt/mmc/Roms/PORTS/測試遊戲/savedata/profile.dat"
+printf 'PORT-SAVE\n' >"$ROOTFS/mnt/mmc/Roms/PORTS/仙劍奇俠傳/savedata/profile.dat"
 printf 'MMC-OPENBOR-SAVE\n' >"$ROOTFS/mnt/mmc/Roms/OPENBOR/Chrono Killer/Saves/Chrono Killer.cfg"
 printf 'TF2-CONTENT-STATE\n' >"$ROOTFS/mnt/sdcard/Roms/GBC/mGBA/crystal.state12"
 printf 'TF2-OPENBOR-SAVE\n' >"$ROOTFS/mnt/sdcard/Roms/OPENBOR/Final Fight/Saves/Final Fight.cfg"
@@ -146,7 +151,7 @@ for relative in \
     'mnt/mmc/Roms/RPG/EasyRPG Player/Save01.lsd' \
     mnt/mmc/Roms/NDS/melonDS/pokemon.dsv \
     mnt/sdcard/Roms/GBC/mGBA/crystal.state12 \
-    'mnt/mmc/Roms/PORTS/測試遊戲/savedata/profile.dat' \
+    'mnt/mmc/Roms/PORTS/仙劍奇俠傳/savedata/profile.dat' \
     'mnt/mmc/Roms/OPENBOR/Chrono Killer/Saves/Chrono Killer.cfg' \
     'mnt/sdcard/Roms/OPENBOR/Final Fight/Saves/Final Fight.cfg'; do
     encoded=$(printf '%s' "$relative" | base64 -w0)
@@ -170,11 +175,14 @@ BACKUP=$("$CTL" backup-before-core-switch --from mgba-old --to mgba-aarch64)
 grep -q '^from_core=mgba-old$' "$BACKUP/core-switch.txt"
 grep -q '^to_core=mgba-aarch64$' "$BACKUP/core-switch.txt"
 ARCHIVE_LIST="$FIXTURE/archive.list"
-tar -tzf "$BACKUP/saves.tar.gz" >"$ARCHIVE_LIST"
+# Keep archive member names byte-literal even when the release build pins
+# LC_ALL=C.  GNU tar otherwise backslash-escapes UTF-8 names while listing,
+# which makes a present non-ASCII save path look absent to the exact checks.
+tar --quoting-style=literal -tzf "$BACKUP/saves.tar.gz" >"$ARCHIVE_LIST"
 grep -Fqx 'mnt/data/retroarch/saves/pokemon.srm' "$ARCHIVE_LIST"
 grep -Fqx 'mnt/data/rg40xxv/state/aarch64-retroarch/saves/mainline.srm' "$ARCHIVE_LIST"
 grep -Fqx 'mnt/data/rg40xxv/state/aarch64-retroarch/states/mainline.state' "$ARCHIVE_LIST"
-grep -Fqx 'mnt/mmc/Roms/PORTS/測試遊戲/savedata/profile.dat' "$ARCHIVE_LIST"
+grep -Fqx 'mnt/mmc/Roms/PORTS/仙劍奇俠傳/savedata/profile.dat' "$ARCHIVE_LIST"
 for relative in \
     .config/retroarch/saves/stock-root.srm \
     .config/retroarch/states/stock-root.state \

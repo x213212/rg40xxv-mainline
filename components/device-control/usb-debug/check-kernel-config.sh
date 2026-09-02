@@ -42,8 +42,16 @@ required=(
     CONFIG_USB_CONFIGFS
     CONFIG_USB_CONFIGFS_ACM
     CONFIG_USB_CONFIGFS_RNDIS
+    CONFIG_USB_U_SERIAL
     CONFIG_USB_U_ETHER
     CONFIG_USB_F_ACM
+    CONFIG_USB_F_RNDIS
+    CONFIG_USB_MUSB_HDRC
+    CONFIG_USB_MUSB_DUAL_ROLE
+    CONFIG_USB_MUSB_SUNXI
+    CONFIG_PHY_SUN4I_USB
+    CONFIG_USB_ROLE_SWITCH
+    CONFIG_EXTCON
     CONFIG_TTY
 )
 
@@ -57,16 +65,9 @@ for symbol in "${required[@]}"; do
     fi
 done
 
-if grep -Eq '^CONFIG_(USB_.+_UDC|USB_MUSB_HDRC|USB_DWC2)=(y|m)$' "$config"; then
-    printf 'OK      找到候選 UDC controller driver\n'
-else
-    printf 'WARNING 無法由 config 找到常見 UDC driver；仍須以 DTS 與 /sys/class/udc 驗證\n' >&2
-fi
-
 if ((missing)); then
-    printf '結果：USB debug 核心必要條件不完整。\n' >&2
+    printf '結果：RG40XX V USB debug 核心必要條件不完整。\n' >&2
     exit 1
 fi
 
-printf '結果：通用 configfs/ACM/RNDIS 條件齊全；仍須實機驗證 UDC 與 Type-C data role。\n'
-
+printf '結果：MUSB Sunxi/configfs/ACM/RNDIS 條件齊全；仍須實機驗證 UDC probe/bind 與 Type-C data path。\n'

@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+usage()
+{
+	printf 'usage: %s https://youtu.be/VIDEO_ID\n' "$0" >&2
+	exit 64
+}
+
+[[ $# == 1 ]] || usage
+watch_url=$1
+[[ ${#watch_url} -le 2048 && $watch_url != -* &&
+   $watch_url != *$'\n'* && $watch_url != *$'\r'* ]] || usage
+case $watch_url in
+	https://youtu.be/*|https://www.youtube.com/watch\?v=*|https://youtube.com/watch\?v=*) ;;
+	*) usage ;;
+esac
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+component_root=${RG_YOUTUBE_COMPONENT_ROOT:-${script_dir%/bin}}
+resolver=${RG_YOUTUBE_RESOLVER:-$component_root/tools/resolve_youtube.py}
+cache_tool=${RG_YOUTUBE_CACHE_TOOL:-$component_root/tools/resolver_cache.py}
+bridge=${RG_YOUTUBE_BRIDGE:-$component_root/tools/bounded_range_bridge.py}
+player=${RG_YOUTUBE_PLAYER:-$component_root/bin/rg40xxv-youtube-player}
+python=${RG_YOUTUBE_PYTHON:-/usr/bin/python3}
+runtime_root=${RG_YOUTUBE_RUNTIME_ROOT:-/run/rg40xxv-youtube-native}
+cache_dir=${RG_YOUTUBE_CACHE_DIR:-$runtime_root/cache}
+
+[[ $component_root == /* && $runtime_root == /* && $runtime_root != / &&
+   $cache_dir == /* && $cache_dir != / &&
+   -x $resolver && ! -L $resolver && -x $cache_tool && ! -L $cache_tool &&
+   -x $bridge && ! -L $bridge &&
+   -x $player && ! -L $player && -x $python ]] || {
+	printf 'YOUTUBE_NATIVE_SESSION result=FAIL reason=runtime-contract\n' >&2
+	exit 66
+}
+[[ ! -L $runtime_root ]] || {
+	printf 'YOUTUBE_NATIVE_SESSION result=FAIL reason=runtime-symlink\n' >&2
+	exit 66
+}
+install -d -m 0700 -- "$runtime_root"
+runtime=$(mktemp -d "$runtime_root/session.XXXXXXXX")
+config=
+ready=$runtime/ready.json
+bridge_log=$runtime/bridge.log
+bridge_pid=
+
+cleanup()
+{
+	trap - EXIT HUP INT TERM
+	if [[ -n $bridge_pid ]] && kill -0 "$bridge_pid" 2>/dev/null; then
+		kill -TERM "$bridge_pid" 2>/dev/null || true
+		for _attempt in {1..20}; do
+			kill -0 "$bridge_pid" 2>/dev/null || break
+			sleep 0.05
+		done
+		kill -KILL "$bridge_pid" 2>/dev/null || true
+		wait "$bridge_pid" 2>/dev/null || true
+	fi
+	if [[ -n $config && -e $config && ! -L $config ]]; then
+		RG_YOUTUBE_CACHE_DIR=$cache_dir \
+			"$cache_tool" release "$config" >/dev/null 2>&1 || true
+	fi
+	find "$runtime" -mindepth 1 -maxdepth 1 -type f -delete 2>/dev/null || true
+	rmdir "$runtime" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+config=$(RG_YOUTUBE_CACHE_DIR=$cache_dir RG_YOUTUBE_RESOLVER=$resolver \
+	"$cache_tool" acquire "$watch_url")
+[[ -f $config && ! -L $config && $(stat -c %a "$config") == 600 ]] || {
+	printf 'YOUTUBE_NATIVE_SESSION result=FAIL reason=cache-claim\n' >&2
+	exit 69
+}
+
+"$bridge" --config "$config" --ready-file "$ready" \
+	--listen 127.0.0.1 --port 0 --chunk-bytes 8388608 \
+	>"$bridge_log" 2>&1 &
+bridge_pid=$!
+for _attempt in {1..200}; do
+	[[ -s $ready ]] && break
+	kill -0 "$bridge_pid" 2>/dev/null || {
+		sed -n '1,20p' "$bridge_log" >&2
+		printf 'YOUTUBE_NATIVE_SESSION result=FAIL reason=bridge-start\n' >&2
+		exit 69
+	}
+	sleep 0.05
+done
+[[ -s $ready ]] || {
+	printf 'YOUTUBE_NATIVE_SESSION result=FAIL reason=bridge-timeout\n' >&2
+	exit 69
+}
+
+# The bridge loads the signed URLs before publishing readiness. Remove the
+# single-use claim immediately; playback thereafter keeps URLs in memory only.
+RG_YOUTUBE_CACHE_DIR=$cache_dir "$cache_tool" release "$config" >/dev/null
+config=
+
+read -r port has_audio < <("$python" - "$ready" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    value = json.load(source)
+port = value.get("port")
+streams = value.get("streams")
+if not isinstance(port, int) or not 1 <= port <= 65535 or not isinstance(streams, list) or "video" not in streams:
+    raise SystemExit(2)
+print(port, 1 if "audio" in streams else 0)
+PY
+)
+video_endpoint=http://127.0.0.1:$port/stream/video
+if [[ $has_audio == 1 ]]; then
+	audio_endpoint=http://127.0.0.1:$port/stream/audio
+	"$player" --device-av "$video_endpoint" "$audio_endpoint"
+else
+	"$player" --device-play "$video_endpoint"
+fi
+printf 'YOUTUBE_NATIVE_SESSION result=RETURNED\n'

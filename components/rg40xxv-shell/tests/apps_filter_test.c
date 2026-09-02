@@ -46,6 +46,7 @@ int main(void)
 		  .favorite = true },
 		{ .title = "Other Game", .system = "GBA", .core = "mGBA",
 		  .favorite = true },
+		{ .title = "YouTube", .system = "APPS", .core = "native" },
 	};
 	char *systems[] = { "APPS", "GBA" };
 	char *cores[] = { "mGBA", "native" };
@@ -66,12 +67,23 @@ int main(void)
 
 	catalog_set_apps_view(&ui, true);
 	CHECK(ui.catalog.apps_only);
-	CHECK(ui.catalog.visible_count == 1);
+	CHECK(ui.catalog.visible_count == 2);
 	CHECK(catalog_visible_id(&ui, 0) == 0);
 	CHECK(strcmp(catalog_visible_game(&ui, 0)->system, "APPS") == 0);
 	CHECK(ui.catalog.system_filter == 2);
 	CHECK(ui.catalog.favorites_only);
 	CHECK(strcmp(ui.catalog.query, "Pokemon") == 0);
+	ui.game_index = 1;
+	ui.carousel_position = 1.0;
+	ui.carousel_from = 1.0;
+	ui.carousel_target = 1.0;
+	catalog_apply_filters(&ui);
+	CHECK(ui.game_index == 1);
+	CHECK(catalog_visible_id(&ui, ui.game_index) == 3);
+	CHECK(strcmp(catalog_visible_game(&ui, ui.game_index)->title,
+		     "YouTube") == 0);
+	CHECK(ui.carousel_position == 1.0);
+	CHECK(ui.carousel_target == 1.0);
 
 	catalog_set_apps_view(&ui, false);
 	CHECK(!ui.catalog.apps_only);
@@ -103,7 +115,7 @@ int main(void)
 	catalog_apply_filters(&ui);
 	CHECK(catalog_visible_id(&ui, 0) == 1);
 	CHECK(catalog_visible_id(&ui, 1) == 2);
-	CHECK(catalog_visible_id(&ui, 2) == 0);
+	CHECK(ui.catalog.visible_count == 2);
 	free(ui.catalog.visible);
 	(void)printf("APPS_FILTER_TEST PASS checks=%u\n", checks);
 	return 0;

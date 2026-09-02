@@ -39,6 +39,7 @@ static void assert_success(struct settings_hardware_result result,
 			   enum settings_hardware_command command, int value)
 {
 	assert(result.command == command);
+	assert(result.request_id != 0U);
 	assert(result.value == value);
 	assert(result.spawn_error == 0);
 	assert(result.exit_code == 0);
@@ -109,12 +110,20 @@ int main(int argc, char **argv)
 	assert(settings.backend.request_reboot_custom(settings.backend.context) == 0);
 	assert(settings.backend.set_volume(settings.backend.context, 35) == 0);
 	assert(settings.backend.toggle_mute(settings.backend.context) == 0);
+	assert(settings_request_network_status(&settings) == 0);
+	assert(settings_request_wifi_recover(&settings) == 0);
+	assert(settings_request_wifi_scan(&settings) == 0);
+	assert(settings_request_wifi_connect(&settings, "11:22:33:44:55:66",
+		"fixture-network-secret") == 0);
+	assert(settings_request_wifi_disconnect(&settings) == 0);
+	assert(settings_request_wifi_forget(&settings,
+		"550e8400-e29b-41d4-a716-446655440000") == 0);
+	assert(settings_request_hotspot_set(&settings, true) == 0);
 	enqueue_elapsed = monotonic_ms() - started;
 	assert(enqueue_elapsed < 50U);
 
 	assert_success(wait_result(&settings), SETTINGS_HW_SCREEN_OFF, 0);
 	assert_success(wait_result(&settings), SETTINGS_HW_SCREEN_ON, 0);
-	assert_success(wait_result(&settings), SETTINGS_HW_BRIGHTNESS, 0);
 	assert_success(wait_result(&settings), SETTINGS_HW_BRIGHTNESS, 100);
 	assert_success(wait_result(&settings), SETTINGS_HW_JOYSTICK_RGB, 100);
 	assert_success(wait_result(&settings), SETTINGS_HW_USB_DEBUG, 0);
@@ -122,6 +131,24 @@ int main(int argc, char **argv)
 	assert_success(wait_result(&settings), SETTINGS_HW_REBOOT_CUSTOM, 0);
 	assert_success(wait_result(&settings), SETTINGS_HW_VOLUME, 35);
 	assert_success(wait_result(&settings), SETTINGS_HW_MUTE_TOGGLE, 0);
+	assert_success(wait_result(&settings), SETTINGS_HW_NETWORK_STATUS, 0);
+	assert_success(wait_result(&settings), SETTINGS_HW_WIFI_RECOVER, 0);
+	assert_success(wait_result(&settings), SETTINGS_HW_WIFI_SCAN, 0);
+	assert_success(wait_result(&settings), SETTINGS_HW_WIFI_CONNECT, 0);
+	assert_success(wait_result(&settings), SETTINGS_HW_WIFI_DISCONNECT, 0);
+	assert_success(wait_result(&settings), SETTINGS_HW_WIFI_FORGET, 0);
+	assert_success(wait_result(&settings), SETTINGS_HW_HOTSPOT_SET, 1);
+	assert(settings_request_wifi_connect(&settings,
+		"11:22:33:44:55:66;id", "fixture-network-secret") == EINVAL);
+	assert(settings_request_wifi_connect(&settings,
+		"11:22:33:44:55:66", "bad\nsecret") == EINVAL);
+	assert(settings_request_wifi_forget(&settings, "../../etc/shadow") == EINVAL);
+	/* Already-applied state returns a synthetic result without another spawn. */
+	assert(settings.backend.apply_backlight(settings.backend.context, 100,
+						 false) == 0);
+	assert(settings.backend.set_volume(settings.backend.context, 35) == 0);
+	assert_success(wait_result(&settings), SETTINGS_HW_BRIGHTNESS, 100);
+	assert_success(wait_result(&settings), SETTINGS_HW_VOLUME, 35);
 
 	assert(settings.backend.apply_backlight(settings.backend.context, 13,
 						 false) == 0);
@@ -133,20 +160,26 @@ int main(int argc, char **argv)
 
 	/*
 	 * Hold the worker in hardwarectl while more than one full queue of
-	 * alternating RGB/USB state changes arrives.  Only each final value may
-	 * remain pending; edge-triggered mute and shutdown requests must survive.
+	 * state changes arrives.  Only each final value may remain pending;
+	 * edge-triggered mute and shutdown requests must survive.
 	 */
 	marker_path(blocked_path, argv[1], ".blocked");
 	marker_path(release_path, argv[1], ".release");
 	assert(settings.backend.apply_backlight(settings.backend.context, 97,
 						 false) == 0);
 	wait_for_path(blocked_path);
+	for (int attempt = 0; attempt < 1000; ++attempt)
+		assert(settings.backend.apply_backlight(settings.backend.context, 97,
+							 false) == 0);
 	for (int value = 0; value < 64; ++value) {
 		preferences.joystick_rgb_brightness = value;
 		assert(settings.backend.apply_joystick_rgb(
 			settings.backend.context, &preferences) == 0);
 		assert(settings.backend.set_usb_debug(settings.backend.context,
 						      (value & 1) != 0) == 0);
+		assert(settings.backend.apply_backlight(settings.backend.context,
+							 value, false) == 0);
+		assert(settings.backend.set_volume(settings.backend.context, value) == 0);
 	}
 	assert(settings.backend.toggle_mute(settings.backend.context) == 0);
 	for (int value = 0; value < 64; ++value) {
@@ -155,6 +188,9 @@ int main(int argc, char **argv)
 			settings.backend.context, &preferences) == 0);
 		assert(settings.backend.set_usb_debug(settings.backend.context,
 						      (value & 1) != 0) == 0);
+		assert(settings.backend.apply_backlight(settings.backend.context,
+							 value, false) == 0);
+		assert(settings.backend.set_volume(settings.backend.context, value) == 0);
 	}
 	assert(settings.backend.toggle_mute(settings.backend.context) == 0);
 	assert(settings.backend.request_shutdown(settings.backend.context) == 0);
@@ -163,11 +199,16 @@ int main(int argc, char **argv)
 	assert_success(wait_result(&settings), SETTINGS_HW_MUTE_TOGGLE, 0);
 	assert_success(wait_result(&settings), SETTINGS_HW_JOYSTICK_RGB, 63);
 	assert_success(wait_result(&settings), SETTINGS_HW_USB_DEBUG, 1);
+	assert_success(wait_result(&settings), SETTINGS_HW_BRIGHTNESS, 63);
+	assert_success(wait_result(&settings), SETTINGS_HW_VOLUME, 63);
 	assert_success(wait_result(&settings), SETTINGS_HW_MUTE_TOGGLE, 0);
 	assert_success(wait_result(&settings), SETTINGS_HW_ORDERLY_SHUTDOWN, 0);
 
 	assert(settings.backend.apply_backlight(settings.backend.context, 98,
 						 false) == 0);
+	for (int attempt = 0; attempt < 1000; ++attempt)
+		assert(settings.backend.apply_backlight(settings.backend.context, 98,
+							 false) == 0);
 	result = wait_result(&settings);
 	assert(result.command == SETTINGS_HW_BRIGHTNESS);
 	assert(result.value == 98);

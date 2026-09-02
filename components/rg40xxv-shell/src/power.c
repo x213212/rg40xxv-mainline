@@ -1,5 +1,6 @@
 #include "power.h"
 
+#include <limits.h>
 #include <string.h>
 
 enum {
@@ -77,6 +78,18 @@ unsigned int power_button_release(struct power_state *state, uint32_t now)
 	return short_press(state);
 }
 
+unsigned int power_auto_screen_off(struct power_state *state)
+{
+	if (state->power_held ||
+	    (state->view != POWER_VIEW_ACTIVE &&
+	     state->view != POWER_VIEW_LOCKED))
+		return POWER_ACTION_NONE;
+	state->locked = state->view == POWER_VIEW_LOCKED || state->lock_enabled;
+	state->view = POWER_VIEW_SCREEN_OFF;
+	state->unlock_progress = 0;
+	return POWER_ACTION_BACKLIGHT_OFF;
+}
+
 unsigned int power_update(struct power_state *state, uint32_t now)
 {
 	if (!state->power_held)
@@ -149,4 +162,22 @@ int power_next_timeout_ms(const struct power_state *state, uint32_t now)
 	if (now - deadline < UINT32_C(0x80000000))
 		return 0;
 	return (int)(deadline - now);
+}
+
+int power_idle_timeout_ms(const struct power_state *state,
+			  uint32_t last_activity, uint32_t idle_ms,
+			  uint32_t now)
+{
+	uint32_t deadline;
+	uint32_t remaining;
+
+	if (idle_ms == 0U || state->power_held ||
+	    (state->view != POWER_VIEW_ACTIVE &&
+	     state->view != POWER_VIEW_LOCKED))
+		return -1;
+	deadline = last_activity + idle_ms;
+	if (now - deadline < UINT32_C(0x80000000))
+		return 0;
+	remaining = deadline - now;
+	return remaining > (uint32_t)INT_MAX ? INT_MAX : (int)remaining;
 }

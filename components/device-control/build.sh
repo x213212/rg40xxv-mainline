@@ -23,6 +23,7 @@ SCRIPTS=(
     "$DEVICE_CONTROL_ROOT/vpn/vpn-profilectl"
     "$DEVICE_CONTROL_ROOT/vpn/vpn-firewall"
 	"$DEVICE_CONTROL_ROOT/network/rg40xxv-network-control"
+	"$DEVICE_CONTROL_ROOT/power-monitor/rg40xxv-power-monitor"
     "$DEVICE_CONTROL_ROOT/tests/test-usb-debug.sh"
     "$DEVICE_CONTROL_ROOT/tests/test-debug-logctl.sh"
     "$DEVICE_CONTROL_ROOT/tests/test-save-guard.sh"
@@ -32,6 +33,7 @@ SCRIPTS=(
     "$DEVICE_CONTROL_ROOT/tests/test-cpu-policy.sh"
     "$DEVICE_CONTROL_ROOT/tests/test-vpn.sh"
 	"$DEVICE_CONTROL_ROOT/tests/test-network-control.sh"
+	"$DEVICE_CONTROL_ROOT/tests/test-power-monitor.sh"
 )
 
 C_SOURCES=(
@@ -68,6 +70,7 @@ run_tests() {
     "$DEVICE_CONTROL_ROOT/tests/test-cpu-policy.sh"
     "$DEVICE_CONTROL_ROOT/tests/test-vpn.sh"
 	"$DEVICE_CONTROL_ROOT/tests/test-network-control.sh"
+	"$DEVICE_CONTROL_ROOT/tests/test-power-monitor.sh"
 }
 
 build_package() {
@@ -128,6 +131,8 @@ build_package() {
         "$stage/usr/sbin/vpn-firewall"
 	install -m 0755 "$DEVICE_CONTROL_ROOT/network/rg40xxv-network-control" \
 		"$stage/usr/sbin/rg40xxv-network-control"
+	install -m 0755 "$DEVICE_CONTROL_ROOT/power-monitor/rg40xxv-power-monitor" \
+		"$stage/usr/sbin/rg40xxv-power-monitor"
     install -m 0644 "$DEVICE_CONTROL_ROOT/usb-debug/rg40xxv-usb-debug.service" \
         "$stage/usr/lib/systemd/system/"
     install -m 0644 "$DEVICE_CONTROL_ROOT/usb-debug/rg40xxv-usb-debug-getty.service" \

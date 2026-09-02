@@ -2,12 +2,26 @@
 set -eu
 
 : "${FAKE_STREAM_CAPTURE:?}"
-if test "$#" -ne 8; then
-	printf 'expected stream mode plus 7 arguments, received %s\n' "$#" >&2
-	exit 64
-fi
 printf '<%s>\n' "$@" >"$FAKE_STREAM_CAPTURE"
-if test "${FAKE_STREAM_EVENT_MARKER:-0}" = 1; then
-	printf '%s\n' 'FAKE_STREAM_RUNNER STARTED' >&2
-fi
-exit "${FAKE_STREAM_EXIT:-0}"
+case ${1:-} in
+	stream)
+		if test "$#" -ne 8; then
+			printf 'expected stream mode plus 7 arguments, received %s\n' "$#" >&2
+			exit 64
+		fi
+		if test "${FAKE_STREAM_EVENT_MARKER:-0}" = 1; then
+			printf '%s\n' 'FAKE_STREAM_RUNNER STARTED' >&2
+		fi
+		exit "${FAKE_STREAM_EXIT:-0}"
+		;;
+	pair)
+		if test "$#" -ne 3; then
+			printf 'expected pair HOST PIN, received %s arguments\n' "$#" >&2
+			exit 64
+		fi
+		printf 'Please enter the following PIN on the target PC: %s\n' "$3"
+		printf '%s\n' 'Succesfully paired'
+		exit "${FAKE_STREAM_PAIR_EXIT:-0}"
+		;;
+	*) exit 64 ;;
+esac

@@ -3,6 +3,7 @@
 #include "ui.h"
 #include "input_latch_snapshot.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
 #include <stdio.h>
@@ -119,14 +120,34 @@ static void apply_navigation_filter(struct ui *ui)
 		catalog_set_apps_view(ui, true);
 		return;
 	}
+	if (ui->nav_index == NAV_PAGE_RPG) {
+		ui->catalog.recent_only = false;
+		ui->catalog.favorites_only = false;
+		catalog_set_rpg_view(ui, true);
+		persistence_request_filters(ui);
+		return;
+	}
 	if (ui->catalog.apps_only)
 		catalog_set_apps_view(ui, false);
+	if (ui->catalog.rpg_only)
+		catalog_set_rpg_view(ui, false);
 	if (ui->nav_index > NAV_PAGE_FAVORITES)
 		return;
 	ui->catalog.recent_only = ui->nav_index == NAV_PAGE_RECENT;
 	ui->catalog.favorites_only = ui->nav_index == NAV_PAGE_FAVORITES;
 	catalog_apply_filters(ui);
 	persistence_request_filters(ui);
+}
+
+static void navigation_page_will_change(struct ui *ui)
+{
+	if (ui->nav_index == NAV_PAGE_SETTINGS)
+		settings_ui_leave_page(ui);
+	if (ui->nav_index == NAV_PAGE_NETWORK)
+		network_ui_leave_page(ui);
+	++ui->navigation_epoch;
+	if (ui->navigation_epoch == 0U)
+		++ui->navigation_epoch;
 }
 
 static bool focus_key_from_sdl(SDL_Keycode key, enum ui_focus_key *focus_key)
@@ -156,17 +177,31 @@ static bool handle_focus_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 
 	if (!focus_key_from_sdl(key, &focus_key))
 		return false;
+	if (focus_key == UI_FOCUS_KEY_BACK &&
+	    ui->focus_region == UI_FOCUS_CONTENT &&
+	    ui->nav_index == NAV_PAGE_SETTINGS && settings_ui_back(ui)) {
+		audio_play_chime(ui, 1710.0);
+		return true;
+	}
+	if (focus_key == UI_FOCUS_KEY_BACK &&
+	    ui->focus_region == UI_FOCUS_CONTENT &&
+	    ui->nav_index == NAV_PAGE_NETWORK && network_ui_back(ui)) {
+		audio_play_chime(ui, 1710.0);
+		return true;
+	}
 	result = ui_focus_resolve(ui->focus_region, focus_key, ui->nav_index,
 		NAV_PAGE_LIBRARY,
 		ui->resident);
 	ui->focus_region = result.region;
 	switch (result.intent) {
 	case UI_FOCUS_INTENT_PREVIOUS_TAB:
+		navigation_page_will_change(ui);
 		ui->nav_index = (ui->nav_index + NAV_COUNT - 1) % NAV_COUNT;
 		apply_navigation_filter(ui);
 		audio_play_chime(ui, 1710.0);
 		break;
 	case UI_FOCUS_INTENT_NEXT_TAB:
+		navigation_page_will_change(ui);
 		ui->nav_index = (ui->nav_index + 1) % NAV_COUNT;
 		apply_navigation_filter(ui);
 		audio_play_chime(ui, 1870.0);
@@ -174,6 +209,9 @@ static bool handle_focus_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 	case UI_FOCUS_INTENT_CONTENT_UP:
 		if (ui->nav_index == NAV_PAGE_SETTINGS) {
 			settings_ui_move(ui, -1);
+			audio_play_chime(ui, 1780.0);
+		} else if (ui->nav_index == NAV_PAGE_STREAMING) {
+			stream_move_setting(ui, -1);
 			audio_play_chime(ui, 1780.0);
 		} else if (ui->nav_index == NAV_PAGE_NETWORK) {
 			network_ui_select(ui, -1);
@@ -184,6 +222,9 @@ static bool handle_focus_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 		if (ui->nav_index == NAV_PAGE_SETTINGS) {
 			settings_ui_move(ui, 1);
 			audio_play_chime(ui, 1640.0);
+		} else if (ui->nav_index == NAV_PAGE_STREAMING) {
+			stream_move_setting(ui, 1);
+			audio_play_chime(ui, 1640.0);
 		} else if (ui->nav_index == NAV_PAGE_NETWORK) {
 			network_ui_select(ui, 1);
 			audio_play_chime(ui, 1640.0);
@@ -193,7 +234,7 @@ static bool handle_focus_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 		if (ui->nav_index == NAV_PAGE_SETTINGS)
 			settings_ui_adjust(ui, -1, now);
 		else if (ui->nav_index == NAV_PAGE_STREAMING) {
-			stream_select_host(ui, -1);
+			stream_adjust_setting(ui, -1, now);
 			audio_play_chime(ui, 1710.0);
 		} else if (ui->nav_index == NAV_PAGE_NETWORK) {
 			network_ui_select(ui, -1);
@@ -207,7 +248,7 @@ static bool handle_focus_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 		if (ui->nav_index == NAV_PAGE_SETTINGS)
 			settings_ui_adjust(ui, 1, now);
 		else if (ui->nav_index == NAV_PAGE_STREAMING) {
-			stream_select_host(ui, 1);
+			stream_adjust_setting(ui, 1, now);
 			audio_play_chime(ui, 1870.0);
 		} else if (ui->nav_index == NAV_PAGE_NETWORK) {
 			network_ui_select(ui, 1);
@@ -228,6 +269,7 @@ static bool handle_focus_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 			launch_queue_selected(ui, now);
 		break;
 	case UI_FOCUS_INTENT_RETURN_LIBRARY:
+		navigation_page_will_change(ui);
 		ui->nav_index = NAV_PAGE_LIBRARY;
 		apply_navigation_filter(ui);
 		break;
@@ -243,6 +285,7 @@ static bool handle_focus_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 static void handle_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 {
 	metrics_note_input(ui);
+	ui->last_user_activity_at = now;
 	/* The physical power path remains live while controller input is gated. */
 	if (key == SDLK_POWER) {
 		(void)power_ui_handle_key(ui, key, now);
@@ -250,9 +293,17 @@ static void handle_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 	}
 	if (input_latch_waiting(&ui->input_latch))
 		return;
+	if (!ui->benchmark && (key == SDLK_RETURN || key == SDLK_SPACE) &&
+	    !input_activation_guard_consume(&ui->activation_guard))
+		return;
 	if (power_ui_handle_key(ui, key, now))
 		return;
-	if (ui->launch.pending || ui->launch.process.active)
+	if (ui->launch.pending) {
+		if (key == SDLK_ESCAPE && launch_cancel_pending(ui, now))
+			audio_play_chime(ui, 1380.0);
+		return;
+	}
+	if (ui->launch.process.active)
 		return;
 	if (ui->launch.transition == LAUNCH_TRANSITION_ERROR) {
 		if (key == SDLK_RETURN || key == SDLK_SPACE) {
@@ -283,6 +334,8 @@ static void handle_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 		case SDLK_LEFT:
 			if (ui->quick_menu_index == 5)
 				locale_toggle(ui);
+			else if (ui->quick_menu_index == 4 && ui->catalog.rpg_only)
+				rpg_translation_toggle_selected(ui, now);
 			else
 				catalog_cycle_filter(ui, ui->quick_menu_index, -1);
 			audio_play_chime(ui, 1710.0);
@@ -292,6 +345,8 @@ static void handle_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 		case SDLK_SPACE:
 			if (ui->quick_menu_index == 5)
 				locale_toggle(ui);
+			else if (ui->quick_menu_index == 4 && ui->catalog.rpg_only)
+				rpg_translation_toggle_selected(ui, now);
 			else
 				catalog_cycle_filter(ui, ui->quick_menu_index, 1);
 			audio_play_chime(ui, 1870.0);
@@ -314,17 +369,20 @@ static void handle_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 		if (ui->nav_index == NAV_PAGE_STREAMING) {
 			int result = stream_reload(ui);
 
-			render_activate(ui, tr(ui, result == 0 ? "stream_reloaded" :
+			render_activate(ui, tr(ui, result == 0 ? "stream_scan_queued" :
 						"stream_load_failed"), now);
+		} else if (ui->nav_index == NAV_PAGE_NETWORK) {
+			network_ui_secondary(ui, now);
 		} else if (ui->nav_index != NAV_PAGE_APPS &&
-			   ui->nav_index != NAV_PAGE_NETWORK &&
 			   ui->nav_index != NAV_PAGE_SETTINGS) {
 			search_open(ui);
 		}
 		break;
 	case SDLK_y:
 	case SDLK_F2:
-		if (ui->nav_index != NAV_PAGE_STREAMING &&
+		if (ui->nav_index == NAV_PAGE_NETWORK) {
+			network_ui_tertiary(ui, now);
+		} else if (ui->nav_index != NAV_PAGE_STREAMING &&
 		    ui->nav_index != NAV_PAGE_APPS &&
 		    ui->nav_index != NAV_PAGE_NETWORK &&
 		    ui->nav_index != NAV_PAGE_SETTINGS) {
@@ -336,7 +394,8 @@ static void handle_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 	case SDLK_F3:
 		if (ui->nav_index != NAV_PAGE_STREAMING &&
 		    ui->nav_index != NAV_PAGE_APPS &&
-		    ui->nav_index != NAV_PAGE_NETWORK)
+		    ui->nav_index != NAV_PAGE_NETWORK &&
+		    ui->nav_index != NAV_PAGE_SETTINGS)
 			catalog_toggle_favorite(ui);
 		break;
 	default:
@@ -375,6 +434,12 @@ static void handle_evdev_key(struct ui *ui, unsigned int code, uint32_t now)
 	case 0x138: handle_key(ui, SDLK_F2, now); break;
 	default: break;
 	}
+}
+
+static bool evdev_is_activation(const struct ui *ui, unsigned int code)
+{
+	return ui->input_profile == INPUT_PROFILE_H700_MAINLINE ?
+		code == BTN_EAST : code == 0x130;
 }
 
 static void handle_evdev_axis(struct ui *ui, unsigned int code, int value,
@@ -429,16 +494,24 @@ static bool reacquire_evdev_state(struct ui *ui, uint32_t now)
 		read_evdev_abs_capabilities, read_evdev_abs, &ui->input_fd);
 }
 
-static void handle_evdev(struct ui *ui, uint32_t now)
+static bool open_evdev_gamepad(struct ui *ui);
+
+static bool handle_evdev(struct ui *ui, uint32_t now)
 {
 	struct input_event events[16];
 	ssize_t count;
+	bool activity = false;
 
-	if (ui->input_fd < 0)
-		return;
+	if (ui->input_fd < 0) {
+		if ((int32_t)(now - ui->input_retry_at) >= 0 &&
+		    !open_evdev_gamepad(ui))
+			ui->input_retry_at = now + 1000U;
+		return false;
+	}
 	while ((count = read(ui->input_fd, events, sizeof(events))) > 0) {
 		size_t event_count = (size_t)count / sizeof(events[0]);
 
+		activity = true;
 		for (size_t i = 0; i < event_count; ++i) {
 			int latch_index;
 
@@ -476,20 +549,31 @@ static void handle_evdev(struct ui *ui, uint32_t now)
 					INPUT_LATCH_EVDEV_BUTTON_BASE +
 					(size_t)latch_index,
 					events[i].value != 0, now);
+			if (events[i].type == EV_KEY && events[i].value == 0 &&
+			    evdev_is_activation(ui, events[i].code))
+				input_activation_guard_release(&ui->activation_guard);
 			if (events[i].type == EV_KEY && events[i].code == KEY_POWER &&
-			    events[i].value == 1)
+			    events[i].value == 1) {
+				ui->last_user_activity_at = now;
 				power_ui_apply(ui,
 					power_button_press(&ui->power, now), now);
+			}
 			else if (events[i].type == EV_KEY &&
-				 events[i].code == KEY_POWER && events[i].value == 0)
+				 events[i].code == KEY_POWER && events[i].value == 0) {
+				ui->last_user_activity_at = now;
 				power_ui_apply(ui,
 					power_button_release(&ui->power, now), now);
+			}
 			else if (events[i].type == EV_KEY &&
 				 (events[i].value == 1 ||
 				  (events[i].value == 2 &&
 				   ui->focus_region == UI_FOCUS_CONTENT &&
 				   ui->nav_index == NAV_PAGE_SETTINGS &&
-				   ui->settings_index == 5 &&
+				   ui->settings_detail_active &&
+				   (ui->settings_index == 0 ||
+				    ui->settings_index == 1 ||
+				    ui->settings_index == 5 ||
+				    ui->settings_index == 6) &&
 				   (events[i].code == BTN_DPAD_LEFT ||
 				    events[i].code == BTN_DPAD_RIGHT))))
 				handle_evdev_key(ui, events[i].code, now);
@@ -497,6 +581,22 @@ static void handle_evdev(struct ui *ui, uint32_t now)
 				handle_evdev_axis(ui, events[i].code, events[i].value, now);
 		}
 	}
+	if (count == 0 || (count < 0 && errno != EAGAIN &&
+				    errno != EWOULDBLOCK)) {
+		int error = count == 0 ? ENODEV : errno;
+
+		close(ui->input_fd);
+		ui->input_fd = -1;
+		ui->input_profile = INPUT_PROFILE_NONE;
+		ui->input_evdev_sync_lost = false;
+		ui->input_retry_at = now + 1000U;
+		input_latch_init(&ui->input_latch, now,
+			INPUT_LATCH_NEUTRAL_STABLE_MS);
+		(void)fprintf(stderr,
+			"INPUT_GAMEPAD_EVDEV status=lost error=%d retry_ms=1000\n",
+			error);
+	}
+	return activity;
 }
 
 static bool open_evdev_gamepad(struct ui *ui)
@@ -523,6 +623,7 @@ static bool open_evdev_gamepad(struct ui *ui)
 			continue;
 		}
 		ui->input_fd = fd;
+		ui->input_retry_at = 0U;
 		input_navigation_init(&ui->input_navigation);
 		if (!reacquire_evdev_state(ui, SDL_GetTicks())) {
 			close(fd);
@@ -534,6 +635,139 @@ static bool open_evdev_gamepad(struct ui *ui)
 		return true;
 	}
 	return false;
+}
+
+static bool open_evdev_power(struct ui *ui, bool report_missing)
+{
+	for (int index = 0; index < 32; ++index) {
+		char path[64];
+		char name[64] = { 0 };
+		unsigned long event_bits[(EV_MAX + 8UL * sizeof(unsigned long)) /
+			(8UL * sizeof(unsigned long))] = { 0 };
+		unsigned long key_bits[(KEY_MAX + 8UL * sizeof(unsigned long)) /
+			(8UL * sizeof(unsigned long))] = { 0 };
+		const size_t bits_per_long = 8U * sizeof(unsigned long);
+		int fd;
+
+		(void)snprintf(path, sizeof(path), "/dev/input/event%d", index);
+		fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+		if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0 ||
+		    strcmp(name, "axp20x-pek") != 0 ||
+		    ioctl(fd, EVIOCGBIT(0, sizeof(event_bits)), event_bits) < 0 ||
+		    (event_bits[EV_KEY / bits_per_long] &
+		     (1UL << (EV_KEY % bits_per_long))) == 0UL ||
+		    ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) < 0 ||
+		    (key_bits[KEY_POWER / bits_per_long] &
+		     (1UL << (KEY_POWER % bits_per_long))) == 0UL) {
+			close(fd);
+			continue;
+		}
+		ui->power_input_fd = fd;
+		(void)fprintf(stderr,
+			"INPUT_POWER_EVDEV status=ready name=%s path=%s\n",
+			name, path);
+		return true;
+	}
+	if (report_missing)
+		(void)fprintf(stderr,
+			"INPUT_POWER_EVDEV status=unavailable expected=axp20x-pek\n");
+	return false;
+}
+
+static void cancel_uncertain_power_press(struct ui *ui, uint32_t now)
+{
+	if (ui->power.view == POWER_VIEW_SHUTDOWN_COUNTDOWN)
+		power_ui_apply(ui, power_cancel_shutdown(&ui->power), now);
+	ui->power.power_held = false;
+	ui->power.shutdown_requested = false;
+}
+
+static void power_input_fault(struct ui *ui, uint32_t now, int error)
+{
+	if (ui->power_input_fd >= 0)
+		close(ui->power_input_fd);
+	ui->power_input_fd = -1;
+	(void)power_input_filter_fault(&ui->power_input_filter);
+	ui->power_input_retry_at = now + 1000U;
+	cancel_uncertain_power_press(ui, now);
+	(void)fprintf(stderr,
+		"INPUT_POWER_EVDEV status=lost error=%d retry_ms=1000\n", error);
+}
+
+static int power_key_pressed(int fd)
+{
+	unsigned long key_bits[(KEY_MAX + 8UL * sizeof(unsigned long)) /
+		(8UL * sizeof(unsigned long))] = { 0 };
+	const size_t bits_per_long = 8U * sizeof(unsigned long);
+
+	if (ioctl(fd, EVIOCGKEY(sizeof(key_bits)), key_bits) < 0)
+		return -1;
+	return (key_bits[KEY_POWER / bits_per_long] &
+		(1UL << (KEY_POWER % bits_per_long))) != 0UL ? 1 : 0;
+}
+
+static bool handle_power_evdev(struct ui *ui, uint32_t now)
+{
+	struct input_event events[8];
+	ssize_t count;
+	bool activity = false;
+
+	if (ui->power_input_fd < 0) {
+		if ((int32_t)(now - ui->power_input_retry_at) >= 0 &&
+		    !open_evdev_power(ui, false))
+			ui->power_input_retry_at = now + 1000U;
+		return false;
+	}
+	for (;;) {
+		count = read(ui->power_input_fd, events, sizeof(events));
+		if (count == 0) {
+			power_input_fault(ui, now, ENODEV);
+			return activity;
+		}
+		if (count < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return activity;
+			power_input_fault(ui, now, errno);
+			return activity;
+		}
+		size_t event_count = (size_t)count / sizeof(events[0]);
+
+		activity = true;
+		for (size_t i = 0; i < event_count; ++i) {
+			enum power_input_filter_action action =
+				power_input_filter_event(&ui->power_input_filter,
+					events[i].type, events[i].code,
+					events[i].value);
+
+			if (action == POWER_INPUT_FILTER_CANCEL) {
+				cancel_uncertain_power_press(ui, now);
+				continue;
+			}
+			if (action == POWER_INPUT_FILTER_RESYNC) {
+				int pressed = power_key_pressed(ui->power_input_fd);
+
+				if (pressed < 0) {
+					power_input_fault(ui, now, errno);
+					return activity;
+				}
+				power_input_filter_resync(&ui->power_input_filter,
+					pressed != 0);
+				continue;
+			}
+			if (action == POWER_INPUT_FILTER_PRESS) {
+				ui->last_user_activity_at = now;
+				power_ui_apply(ui,
+					power_button_press(&ui->power, now), now);
+			} else if (action == POWER_INPUT_FILTER_RELEASE) {
+				ui->last_user_activity_at = now;
+				power_ui_apply(ui,
+					power_button_release(&ui->power, now), now);
+			}
+		}
+	}
+	return activity;
 }
 
 static void snapshot_sdl_state(struct ui *ui, uint32_t now)
@@ -595,6 +829,10 @@ static void track_sdl_latch_event(struct ui *ui, const SDL_Event *event,
 			input_latch_set(&ui->input_latch,
 				INPUT_LATCH_KEYBOARD_BASE + (size_t)index,
 				event->type == SDL_KEYDOWN, now);
+		if (event->type == SDL_KEYUP &&
+		    (event->key.keysym.sym == SDLK_RETURN ||
+		     event->key.keysym.sym == SDLK_SPACE))
+			input_activation_guard_release(&ui->activation_guard);
 		break;
 	case SDL_CONTROLLERBUTTONDOWN:
 	case SDL_CONTROLLERBUTTONUP:
@@ -605,6 +843,9 @@ static void track_sdl_latch_event(struct ui *ui, const SDL_Event *event,
 			input_latch_set(&ui->input_latch,
 				INPUT_LATCH_CONTROLLER_BUTTON_BASE + (size_t)index,
 				event->type == SDL_CONTROLLERBUTTONDOWN, now);
+		if (event->type == SDL_CONTROLLERBUTTONUP &&
+		    event->cbutton.button == SDL_CONTROLLER_BUTTON_A)
+			input_activation_guard_release(&ui->activation_guard);
 		break;
 	case SDL_CONTROLLERAXISMOTION:
 		if (ui->input_fd >= 0)
@@ -623,6 +864,9 @@ static void track_sdl_latch_event(struct ui *ui, const SDL_Event *event,
 		input_latch_set(&ui->input_latch,
 			INPUT_LATCH_JOYSTICK_BUTTON_BASE + event->jbutton.button,
 			event->type == SDL_JOYBUTTONDOWN, now);
+		if (event->type == SDL_JOYBUTTONUP &&
+		    (event->jbutton.button == 0 || event->jbutton.button == 7))
+			input_activation_guard_release(&ui->activation_guard);
 		break;
 	case SDL_JOYHATMOTION:
 		if (ui->input_fd < 0 && ui->controller == NULL &&
@@ -684,15 +928,21 @@ void input_init(struct ui *ui)
 	uint32_t now = SDL_GetTicks();
 
 	ui->input_fd = -1;
+	ui->power_input_fd = -1;
 	ui->input_profile = INPUT_PROFILE_NONE;
 	ui->input_evdev_sync_lost = false;
+	ui->input_retry_at = 0U;
+	power_input_filter_init(&ui->power_input_filter);
+	ui->power_input_retry_at = 0U;
 	input_navigation_init(&ui->input_navigation);
 	input_latch_init(&ui->input_latch, now,
 		INPUT_LATCH_NEUTRAL_STABLE_MS);
+	input_activation_guard_init(&ui->activation_guard);
 	(void)snprintf(ui->input_name, sizeof(ui->input_name), "none");
 	if (!open_evdev_gamepad(ui))
 		input_latch_init(&ui->input_latch, SDL_GetTicks(),
 			INPUT_LATCH_NEUTRAL_STABLE_MS);
+	(void)open_evdev_power(ui, true);
 	for (int i = 0; ui->input_fd < 0 && i < SDL_NumJoysticks(); ++i) {
 		if (SDL_IsGameController(i)) {
 			ui->controller = SDL_GameControllerOpen(i);
@@ -715,11 +965,28 @@ void input_init(struct ui *ui)
 		input_latch_force_ready(&ui->input_latch);
 }
 
-void input_handle_events(struct ui *ui, uint32_t now)
+bool input_handle_events(struct ui *ui, uint32_t now)
 {
 	SDL_Event event;
+	bool activity = input_handle_power_events(ui, now);
 
 	while (SDL_PollEvent(&event)) {
+		/*
+		 * A settings/network worker event is only a wake-up.  Its consumer
+		 * decides whether the completed operation affects the current scene;
+		 * treating it as input here forced a full present even for an off-page
+		 * Wi-Fi scan.
+		 */
+		if (event.type != SDL_USEREVENT ||
+		    event.user.code != SETTINGS_WORKER_EVENT_CODE)
+			activity = true;
+		if ((event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) &&
+		    power_input_ignore_sdl(ui->power_input_fd >= 0,
+			ui->input_fd >= 0,
+			event.key.keysym.sym == SDLK_POWER)) {
+			/* Raw evdev is authoritative; SDL may mirror the same press. */
+			continue;
+		}
 		track_sdl_latch_event(ui, &event, now);
 		if (event.type == SDL_TEXTINPUT || event.type == SDL_KEYDOWN ||
 		    event.type == SDL_CONTROLLERBUTTONDOWN ||
@@ -729,27 +996,49 @@ void input_handle_events(struct ui *ui, uint32_t now)
 		if (event.type == SDL_QUIT) {
 			if (!ui->resident)
 				ui->running = false;
-		} else if (event.type == SDL_TEXTINPUT && ui->search_active)
+		} else if (event.type == SDL_TEXTINPUT &&
+			   ui->network.password_active) {
+			ui->last_user_activity_at = now;
+			(void)network_ui_password_append(ui, event.text.text);
+		} else if (event.type == SDL_TEXTINPUT && ui->search_active) {
+			ui->last_user_activity_at = now;
 			search_append(ui, event.text.text);
-		else if (event.type == SDL_KEYUP &&
+		} else if (event.type == SDL_KEYUP &&
 			 event.key.keysym.sym == SDLK_POWER)
 			power_ui_apply(ui,
 				power_button_release(&ui->power, now), now);
 		else if (event.type == SDL_KEYDOWN &&
 			 (event.key.repeat == 0 || ui->search_active ||
+			  ui->network.password_active ||
 			  (ui->focus_region == UI_FOCUS_CONTENT &&
 			   ui->nav_index == NAV_PAGE_SETTINGS &&
-			   ui->settings_index == 5 &&
+			   ui->settings_detail_active &&
+			   (ui->settings_index == 0 ||
+			    ui->settings_index == 1 ||
+			    ui->settings_index == 5 ||
+			    ui->settings_index == 6) &&
 			   (event.key.keysym.sym == SDLK_LEFT ||
 			    event.key.keysym.sym == SDLK_RIGHT))))
 			handle_key(ui, event.key.keysym.sym, now);
 		else
 			handle_controller_event(ui, &event, now);
 	}
-	handle_evdev(ui, now);
+	activity = handle_evdev(ui, now) || activity;
 	/* Advance only after queued events have refreshed the physical state. */
 	(void)input_latch_update(&ui->input_latch, now);
-	power_ui_apply(ui, power_update(&ui->power, now), now);
+	return activity;
+}
+
+bool input_handle_power_events(struct ui *ui, uint32_t now)
+{
+	unsigned int power_actions;
+	bool activity = handle_power_evdev(ui, now);
+
+	power_actions = power_update(&ui->power, now);
+	if (power_actions != POWER_ACTION_NONE)
+		activity = true;
+	power_ui_apply(ui, power_actions, now);
+	return activity;
 }
 
 void input_close(struct ui *ui)
@@ -757,6 +1046,9 @@ void input_close(struct ui *ui)
 	if (ui->input_fd >= 0)
 		close(ui->input_fd);
 	ui->input_fd = -1;
+	if (ui->power_input_fd >= 0)
+		close(ui->power_input_fd);
+	ui->power_input_fd = -1;
 	if (ui->controller != NULL)
 		SDL_GameControllerClose(ui->controller);
 	else if (ui->joystick != NULL)

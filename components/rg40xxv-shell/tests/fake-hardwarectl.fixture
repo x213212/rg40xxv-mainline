@@ -27,6 +27,13 @@ trap cleanup_lock EXIT HUP INT TERM
 	printf '%s\n' END
 } >>"$capture"
 
+if test "${1:-}" = network-wifi-connect; then
+	IFS= read -r secret
+	test "$secret" = fixture-network-secret
+	printf 'secret-bytes=%s\n' "${#secret}" >"${0}.secret"
+	unset secret
+fi
+
 if test "${1:-}" = brightness && test "${2:-}" = 13; then
 	exit 7
 fi

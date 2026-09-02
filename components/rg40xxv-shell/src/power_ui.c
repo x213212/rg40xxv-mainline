@@ -35,8 +35,11 @@ void power_ui_apply(struct ui *ui, unsigned int actions, uint32_t now)
 
 		if (error == 0)
 			ui->settings.preferences.screen_off = false;
-		else
+		else {
+			ui->settings.preferences.screen_off = true;
+			ui->power.view = POWER_VIEW_SCREEN_OFF;
 			power_backend_error(ui, tr(ui, "screen_power"), error, now);
+		}
 	}
 	if ((actions & POWER_ACTION_LOCK_PROGRESS) != 0U)
 		audio_play_chime(ui, 1640.0 + ui->power.unlock_progress * 100.0);

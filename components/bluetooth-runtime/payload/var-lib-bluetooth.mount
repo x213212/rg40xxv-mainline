@@ -1,0 +1,13 @@
+[Unit]
+Description=Bind persistent RG40XX V Bluetooth state
+DefaultDependencies=no
+Requires=rg40xxv-bluetooth-state.service
+After=local-fs.target rg40xxv-bluetooth-state.service
+Before=bluetooth.service umount.target
+Conflicts=umount.target
+
+[Mount]
+What=/mnt/data/rg40xxv/state/bluetooth
+Where=/var/lib/bluetooth
+Type=none
+Options=bind,nodev,nosuid,noexec

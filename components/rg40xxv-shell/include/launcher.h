@@ -7,6 +7,10 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+enum {
+	LAUNCH_HANDOFF_EXIT_STATUS = 75,
+};
+
 struct launcher_request {
 	const char *executable;
 	const char *route;
@@ -37,6 +41,8 @@ struct launcher_process {
 };
 
 int launcher_request_validate(const struct launcher_request *request);
+int launcher_handoff_write(const char *path,
+			   const struct launcher_request *request);
 int launcher_executable_validate(const char *executable);
 int launcher_process_start(struct launcher_process *process,
 			   const struct launcher_request *request);

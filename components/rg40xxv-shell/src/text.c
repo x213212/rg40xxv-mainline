@@ -93,6 +93,39 @@ int text_width(struct ui *ui, int font_index, const char *text, SDL_Color color)
 	return item != NULL ? item->width : 0;
 }
 
+static size_t utf8_glyph_size(const char *text)
+{
+	unsigned char lead = (unsigned char)text[0];
+
+	if (lead < 0x80U)
+		return 1U;
+	if ((lead & 0xe0U) == 0xc0U)
+		return 2U;
+	if ((lead & 0xf0U) == 0xe0U)
+		return 3U;
+	if ((lead & 0xf8U) == 0xf0U)
+		return 4U;
+	return 1U;
+}
+
+static void text_prewarm_glyphs(struct ui *ui, int font_index,
+				const char *text, SDL_Color color)
+{
+	char glyph[5];
+
+	while (*text != '\0') {
+		size_t remaining = strlen(text);
+		size_t length = utf8_glyph_size(text);
+
+		if (length > remaining)
+			length = 1U;
+		memcpy(glyph, text, length);
+		glyph[length] = '\0';
+		(void)text_width(ui, font_index, glyph, color);
+		text += length;
+	}
+}
+
 void text_prewarm_visible(struct ui *ui)
 {
 	static const SDL_Color primary = { 238, 238, 238, 255 };
@@ -101,6 +134,15 @@ void text_prewarm_visible(struct ui *ui)
 	static const SDL_Color cover_text = { 234, 234, 234, 255 };
 	char fallback[192];
 	size_t count = ui->catalog.visible_count;
+	const char *starting = tr(ui, "launch_starting");
+	const char *restoring = tr(ui, "launch_restoring");
+
+	/* Launch transitions animate cached glyph textures independently.  Warm
+	 * the bounded locale strings here so the first A-to-overlay frame never
+	 * performs per-character TTF rasterization. */
+	text_prewarm_glyphs(ui, 0, starting, secondary);
+	text_prewarm_glyphs(ui, 0, restoring, secondary);
+	(void)text_width(ui, 0, tr(ui, "launch_cancelled"), secondary);
 
 	if (count == 0)
 		return;

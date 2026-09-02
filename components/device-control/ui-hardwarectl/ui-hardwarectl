@@ -12,6 +12,7 @@ usage() {
     printf '%s\n' \
         "用法：$0 screen-off" \
         "      $0 screen-on" \
+		"      $0 recover-awake" \
         "      $0 brightness 0..100" \
         "      $0 joystick-rgb 0..100" \
 		"      $0 volume 0..100" \
@@ -76,7 +77,7 @@ init_helpers() {
     fi
 
 	case $command in
-		screen-off|screen-on|brightness|joystick-rgb)
+		screen-off|screen-on|recover-awake|brightness|joystick-rgb)
 			[[ -f "$power_lockctl" && ! -L "$power_lockctl" && -x "$power_lockctl" ]] || \
 				die "power-lockctl 不可用：$power_lockctl"
 			;;
@@ -123,7 +124,7 @@ run_custom_reboot() {
 
 command=${1:-}
 case $command in
-    screen-off|screen-on)
+    screen-off|screen-on|recover-awake)
         (($# == 1)) || usage
         ;;
     brightness|joystick-rgb|volume)
@@ -168,6 +169,7 @@ init_helpers
 case $command in
     screen-off) run_power_lock screen-off ;;
     screen-on) run_power_lock screen-on ;;
+	recover-awake) run_power_lock recover-awake ;;
     brightness) run_power_lock brightness "$2" ;;
     joystick-rgb) run_power_lock joystick-rgb "$2" ;;
 	volume) run_volume set "$2" ;;

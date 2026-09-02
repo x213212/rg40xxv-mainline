@@ -2,7 +2,7 @@
 set -eu
 
 project=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-workspace=$(CDPATH= cd -- "$project/../.." && pwd -P)
+workspace=${RG40XXV_WORKSPACE:-$(CDPATH= cd -- "$project/../../../.." && pwd -P)}
 temporary=$(mktemp -d)
 trap 'status=$?; trap - EXIT; rm -rf -- "$temporary"; exit "$status"' \
 	EXIT HUP INT TERM

@@ -49,3 +49,6 @@ id_ed25519*
 *.bin
 backup/
 backups/
+
+# Fetched by vendor/fetch-yt-dlp.sh, never committed: a third-party runtime.
+components/youtube/vendor/yt-dlp

@@ -1,0 +1,255 @@
+#!/bin/sh
+set -eu
+umask 077
+
+self=$(readlink -f -- "$0") || {
+	printf '%s\n' 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=self-path' >&2
+	exit 66
+}
+self_root=$(CDPATH= cd -- "$(dirname -- "$self")/.." && pwd -P)
+root=${RG_YOUTUBE_TEXTURE_ROOT:-$self_root}
+state_home=${RG_YOUTUBE_STATE_HOME:-/mnt/data/rg40xxv/state/home}
+runtime_root=${RG_YOUTUBE_RUNTIME_ROOT:-/run/rg40xxv-youtube}
+cache_root=$state_home/.cache/rg40xxv-youtube
+python_input=${RG_YOUTUBE_PYTHON:-/usr/bin/python3}
+python=$(readlink -f -- "$python_input") || {
+	printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=python-path path=%s\n' \
+		"$python_input" >&2
+	exit 66
+}
+server=${RG_YOUTUBE_YTDLP_SERVER:-$root/tools/yt_dlp_server.py}
+socket_path=${RG_YOUTUBE_YTDLP_SOCKET:-$runtime_root/yt-dlp.sock}
+server_cache=${RG_YOUTUBE_YTDLP_CACHE:-$cache_root/yt-dlp}
+yt_dlp=${RG_YOUTUBE_YTDLP:-$root/vendor/yt-dlp}
+unit=${RG_YOUTUBE_RESOLVER_UNIT:-rg40xxv-youtube-resolver.service}
+
+case "$unit" in
+	rg40xxv-youtube-resolver.service) ;;
+	*)
+		printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=unit-name unit=%s\n' \
+			"$unit" >&2
+		exit 66
+		;;
+esac
+
+for executable in "$python" "$server" "$yt_dlp"; do
+	if [ ! -f "$executable" ] || [ -L "$executable" ] || [ ! -x "$executable" ]; then
+		printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=executable path=%s\n' \
+			"$executable" >&2
+		exit 66
+	fi
+done
+for command_name in systemctl systemd-run; do
+	command -v "$command_name" >/dev/null 2>&1 || {
+		printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=missing-%s\n' \
+			"$command_name" >&2
+		exit 66
+	}
+done
+
+for private_directory in "$runtime_root" "$server_cache" "$server_cache/feed"; do
+	if [ -L "$private_directory" ]; then
+		printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=private-directory-symlink path=%s\n' \
+			"$private_directory" >&2
+		exit 66
+	fi
+done
+mkdir -p "$runtime_root" "$server_cache" "$server_cache/feed"
+for private_directory in "$runtime_root" "$server_cache" "$server_cache/feed"; do
+	if [ ! -d "$private_directory" ] || [ -L "$private_directory" ] || \
+	   [ "$(stat -c %u "$private_directory")" -ne "$(id -u)" ]; then
+		printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=private-directory-owner path=%s\n' \
+			"$private_directory" >&2
+		exit 66
+	fi
+	chmod 0700 "$private_directory"
+done
+
+unit_matches()
+{
+	unit_identity_reason=pid
+	resolver_pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null || true)
+	case "$resolver_pid" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$resolver_pid" -gt 1 ] && [ -r "/proc/$resolver_pid/cmdline" ] || return 1
+	unit_identity_reason=python
+	[ "$(readlink -f -- "/proc/$resolver_pid/exe" 2>/dev/null || true)" = \
+		"$python" ] || return 1
+	# All controlled paths reject whitespace, so tokenizing procfs is safe here.
+	# The service may have been started from the immutable /opt tree or from an
+	# exact-byte hot tree.  Accept either path only when both executable payloads
+	# are byte-identical and every shared runtime argument is exact.
+	set -- $(tr '\000' ' ' <"/proc/$resolver_pid/cmdline")
+	unit_identity_reason=argv-count
+	[ "$#" -eq 12 ] || return 1
+	unit_identity_reason=argv-runtime-flag
+	[ "$3" = --runtime-root ] || return 1
+	unit_identity_reason=argv-runtime
+	[ "$4" = "$runtime_root" ] || return 1
+	unit_identity_reason=argv-cache-flag
+	[ "$5" = --cache-dir ] || return 1
+	unit_identity_reason=argv-cache
+	[ "$6" = "$server_cache" ] || return 1
+	unit_identity_reason=argv-socket-flag
+	[ "$7" = --socket ] || return 1
+	unit_identity_reason=argv-socket
+	[ "$8" = "$socket_path" ] || return 1
+	unit_identity_reason=argv-ytdlp-flag
+	[ "$9" = --yt-dlp ] || return 1
+	unit_identity_reason=argv-workers-flag
+	[ "${11}" = --workers ] || return 1
+	unit_identity_reason=argv-workers
+	[ "${12}" = 2 ] || return 1
+	unit_identity_reason=payload-type
+	[ -f "$2" ] && [ ! -L "$2" ] && [ -f "${10}" ] && [ ! -L "${10}" ] || \
+		return 1
+	unit_identity_reason=payload-sha
+	[ "$(sha256sum "$2" | awk '{print $1}')" = \
+		"$(sha256sum "$server" | awk '{print $1}')" ] && \
+		[ "$(sha256sum "${10}" | awk '{print $1}')" = \
+		"$(sha256sum "$yt_dlp" | awk '{print $1}')" ]
+}
+
+probe_unit_socket()
+{
+	[ -S "$socket_path" ] && [ ! -L "$socket_path" ] || return 2
+	[ "$(stat -c %u "$socket_path")" -eq "$(id -u)" ] && \
+		[ "$(stat -c %a "$socket_path")" -eq 600 ] || return 1
+	"$python" - "$socket_path" "$resolver_pid" <<'PY'
+import json
+import os
+import socket
+import struct
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.5)
+try:
+    client.connect(sys.argv[1])
+    if not hasattr(socket, "SO_PEERCRED"):
+        raise RuntimeError("peer credentials unavailable")
+    peer_pid, peer_uid, _peer_gid = struct.unpack(
+        "3i", client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    )
+    if peer_pid != int(sys.argv[2]) or peer_uid != os.geteuid():
+        raise RuntimeError("peer identity mismatch")
+    client.sendall(b'{"version":1,"op":"ping"}\n')
+    response = bytearray()
+    while b"\n" not in response and len(response) <= 4096:
+        block = client.recv(4097 - len(response))
+        if not block:
+            raise RuntimeError("ping truncated")
+        response.extend(block)
+    payload, trailing = bytes(response).split(b"\n", 1)
+    if trailing:
+        raise RuntimeError("ping trailing data")
+    value = json.loads(payload.decode("utf-8", "strict"))
+    if value.get("version") != 1 or value.get("ok") is not True or value.get("workers") != 2:
+        raise RuntimeError("ping contract mismatch")
+except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+finally:
+    client.close()
+PY
+}
+
+if systemctl is-active --quiet "$unit"; then
+	if ! unit_matches; then
+		printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=unit-identity detail=%s unit=%s\n' \
+			"$unit_identity_reason" "$unit" >&2
+		exit 66
+	fi
+	if probe_unit_socket; then
+		resolver_action=REUSE
+	else
+		probe_status=$?
+		if [ "$probe_status" -eq 2 ]; then
+			resolver_action=REUSE-STARTING
+		else
+			printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=socket-peer unit=%s\n' \
+				"$unit" >&2
+			exit 66
+		fi
+	fi
+	printf 'YOUTUBE_RESOLVER_ENSURE result=PASS action=%s unit=%s\n' \
+		"$resolver_action" "$unit"
+	exit 0
+fi
+
+if [ -e "$socket_path" ] || [ -L "$socket_path" ]; then
+	if [ ! -S "$socket_path" ] || [ -L "$socket_path" ] || \
+	   [ "$(stat -c %u "$socket_path")" -ne "$(id -u)" ] || \
+	   [ "$(stat -c %a "$socket_path")" -ne 600 ]; then
+		printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=socket-identity path=%s\n' \
+			"$socket_path" >&2
+		exit 66
+	fi
+	if "$python" - "$socket_path" <<'PY'
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.25)
+try:
+    client.connect(sys.argv[1])
+except OSError:
+    raise SystemExit(1)
+finally:
+    client.close()
+PY
+	then
+		printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=live-socket-without-unit path=%s\n' \
+			"$socket_path" >&2
+		exit 66
+	fi
+fi
+
+# The system manager, not a UI/game-session cgroup, owns the resolver.  Thus a
+# HOME exit, MENU+START, a failed player, or a hot-test scene cannot kill the
+# shared yt-dlp workers and socket.  Concurrent callers race on the unit name;
+# exactly one creates it and the others accept that active unit.
+if systemd-run --quiet --unit="$unit" --collect \
+	--service-type=simple \
+	--property=Restart=on-failure \
+	--property=RestartSec=1s \
+	--property=KillMode=control-group \
+	--property=TimeoutStopSec=3s \
+	--property=StandardOutput=journal \
+	--property=StandardError=journal \
+	"$python" "$server" \
+		--runtime-root "$runtime_root" \
+		--cache-dir "$server_cache" \
+		--socket "$socket_path" \
+		--yt-dlp "$yt_dlp" \
+		--workers 2; then
+	printf 'YOUTUBE_RESOLVER_ENSURE result=PASS action=START unit=%s\n' "$unit"
+	exit 0
+fi
+
+if systemctl is-active --quiet "$unit"; then
+	if ! unit_matches; then
+		printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=race-unit-identity detail=%s unit=%s\n' \
+			"$unit_identity_reason" "$unit" >&2
+		exit 66
+	fi
+	if probe_unit_socket; then
+		resolver_action=RACE-REUSE
+	else
+		probe_status=$?
+		if [ "$probe_status" -eq 2 ]; then
+			resolver_action=RACE-STARTING
+		else
+			printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=race-socket-peer unit=%s\n' \
+				"$unit" >&2
+			exit 66
+		fi
+	fi
+	printf 'YOUTUBE_RESOLVER_ENSURE result=PASS action=%s unit=%s\n' \
+		"$resolver_action" "$unit"
+	exit 0
+fi
+
+printf 'YOUTUBE_RESOLVER_ENSURE result=FAIL reason=unit-start unit=%s\n' \
+	"$unit" >&2
+exit 69

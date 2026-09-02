@@ -1,0 +1,16 @@
+[Unit]
+Description=Prepare persistent RG40XX V Bluetooth state
+RequiresMountsFor=/mnt/data
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=var-lib-bluetooth.mount bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/install -d -o root -g root -m 0700 /mnt/data/rg40xxv/state/bluetooth
+RemainAfterExit=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/mnt/data/rg40xxv/state
+

@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+: "${FAKE_MOONLIGHT_CAPTURE:?}"
+printf '<%s>\n' "$@" >"$FAKE_MOONLIGHT_CAPTURE"
+case ${1:-} in
+	pair)
+		pin=
+		keydir=
+		while test "$#" -gt 0; do
+			if test "$1" = -pin && test "$#" -gt 1; then
+				pin=$2
+				shift 2
+				continue
+			fi
+			if test "$1" = -keydir && test "$#" -gt 1; then
+				keydir=$2
+				shift 2
+				continue
+			fi
+			shift
+		done
+		test -n "$keydir"
+		printf '%s\n' 'fixture-certificate' >"$keydir/client.pem"
+		chmod 0600 "$keydir/client.pem"
+		printf 'Please enter the following PIN on the target PC: %s\n' "$pin"
+		printf '%s\n' 'Succesfully paired'
+		;;
+	list)
+		printf '%s\n' '1. Steam'
+		printf '%s\n' '2. pc'
+		;;
+esac

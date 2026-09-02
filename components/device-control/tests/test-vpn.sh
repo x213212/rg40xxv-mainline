@@ -20,7 +20,7 @@ AUTH="$FIXTURE/auth.txt"
 } >"$OVPN"
 printf '%s\n' '-----BEGIN CERTIFICATE-----' 'CA-DATA' '-----END CERTIFICATE-----' >"$CA"
 printf '%s\n' '-----BEGIN CERTIFICATE-----' 'CERT-DATA' '-----END CERTIFICATE-----' >"$CERT"
-printf '%s\n' "-----BEGIN $(printf 'PRIVATE')  KEY-----" 'PRIVATE-KEY-DATA' "-----END $(printf 'PRIVATE')  KEY-----" >"$KEY"
+printf '%s\n' '-----BEGIN PRIVATE KEY-----' 'PRIVATE-KEY-DATA' '-----END PRIVATE KEY-----' >"$KEY"
 printf 'vpn-user\nsuper-secret-password\n' >"$AUTH"
 
 export DEVICE_CONTROL_TESTING=1

@@ -224,7 +224,7 @@ static const char *find_font(void) {
     if (env && file_exists(env)) return env;
     const char *candidates[] = {
         "/mnt/vendor/bin/default.ttf",
-        "${KERNEL_LAB_ROOT}/firmware/mnt/appfs/bin/default.ttf",
+        "/root/kernel/firmware/mnt/appfs/bin/default.ttf",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         NULL

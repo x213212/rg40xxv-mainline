@@ -25,6 +25,11 @@ struct input_latch {
 	bool waiting;
 };
 
+/* One physical A press may be reported by both SDL and raw evdev. */
+struct input_activation_guard {
+	bool armed;
+};
+
 void input_latch_init(struct input_latch *latch, uint32_t now,
 		      uint32_t stable_interval_ms);
 void input_latch_set(struct input_latch *latch, size_t control, bool active,
@@ -33,6 +38,10 @@ bool input_latch_update(struct input_latch *latch, uint32_t now);
 bool input_latch_waiting(const struct input_latch *latch);
 size_t input_latch_active_count(const struct input_latch *latch);
 void input_latch_force_ready(struct input_latch *latch);
+
+void input_activation_guard_init(struct input_activation_guard *guard);
+void input_activation_guard_release(struct input_activation_guard *guard);
+bool input_activation_guard_consume(struct input_activation_guard *guard);
 
 int input_latch_evdev_button_index(enum input_latch_evdev_profile profile,
 				   unsigned int code);

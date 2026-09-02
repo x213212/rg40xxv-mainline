@@ -2,7 +2,8 @@
 set -eu
 
 project=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-workspace=$(CDPATH= cd -- "$project/../.." && pwd -P)
+workspace=${RG40XXV_WORKSPACE:-$(CDPATH= cd -- "$project/../../../.." && pwd -P)}
+ui_binary=${RG40XXV_UI_BINARY:-$project/build/rg40xxv-shell}
 temporary=$(mktemp -d)
 trap 'status=$?; trap - EXIT; rm -rf -- "$temporary"; exit "$status"' \
 	EXIT HUP INT TERM
@@ -24,13 +25,15 @@ printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAJxAAACcQ' | \
 
 SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
 	qemu-aarch64-static -L "$workspace/firmware/mnt/rootfs" \
-	"$project/build/rg40xxv-shell" \
+		"$ui_binary" \
 	--windowed --font "$project/assets/RG40XXV-UI-Sans.otf" \
 	--rom-root "$rom_root" --screenshot "$screenshot" \
 	>"$output"
 
 grep -Fq 'UI_RESULT PASS' "$output"
-grep -Fq 'roms=3 visible=3 covers=1 cover_rejected=2' "$output"
+# Three library fixtures plus the single fail-closed native-texture YouTube
+# tile.  Missing admission never creates a Web fallback.
+grep -Fq 'roms=4 visible=3 covers=1 cover_rejected=2' "$output"
 peak=$(sed -n 's/.* cover_decode_peak=\([0-9][0-9]*\) .*/\1/p' "$output")
 test -n "$peak"
 test "$peak" -gt 0

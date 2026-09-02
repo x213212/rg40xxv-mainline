@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include <stdio.h>
+#include <string.h>
 
 static const int font_sizes[FONT_COUNT] = { 14, 17, 22, 30 };
 
@@ -71,12 +72,26 @@ void render_destroy(struct ui *ui)
 		(void)SDL_RenderFlush(ui->renderer);
 	if (ui->icon_atlas != NULL)
 		SDL_DestroyTexture(ui->icon_atlas);
+	if (ui->backdrop_cache != NULL)
+		SDL_DestroyTexture(ui->backdrop_cache);
+	for (size_t i = 0; i < 2U; ++i) {
+		if (ui->settings_background_cache[i] != NULL)
+			SDL_DestroyTexture(ui->settings_background_cache[i]);
+		ui->settings_background_cache[i] = NULL;
+	}
+	if (ui->settings_page_cache != NULL)
+		SDL_DestroyTexture(ui->settings_page_cache);
+	ui->settings_page_cache = NULL;
+	ui->settings_page_cache_valid = false;
+	memset(&ui->settings_page_cache_key, 0,
+		sizeof(ui->settings_page_cache_key));
 	if (ui->navigation_cache != NULL)
 		SDL_DestroyTexture(ui->navigation_cache);
 	if (ui->controls_cache != NULL)
 		SDL_DestroyTexture(ui->controls_cache);
 	ui->navigation_cache = NULL;
 	ui->controls_cache = NULL;
+	ui->backdrop_cache = NULL;
 	ui->icon_atlas = NULL;
 	text_cache_destroy(ui);
 	for (int i = 0; i < FONT_COUNT; ++i) {
@@ -119,6 +134,7 @@ int lifecycle_session_resume(struct ui *ui)
 	if (TTF_Init() != 0)
 		return -1;
 	(void)SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
+	(void)SDL_SetHint(SDL_HINT_RENDER_BATCHING, "0");
 	if (lifecycle_graphics_init(ui, ui->launch.font_path,
 				    ui->launch.windowed) != 0)
 		return -1;
@@ -137,6 +153,7 @@ int lifecycle_session_resume(struct ui *ui)
 	if (cover_cache_init(ui) != 0)
 		return -1;
 	text_prewarm_visible(ui);
+	render_prepare_static(ui, SDL_GetTicks());
 	ui->metrics.last_present = 0U;
 	ui->metrics.input_counter = 0U;
 	ui->launch.session_suspended = false;

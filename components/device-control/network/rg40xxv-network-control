@@ -247,7 +247,7 @@ apply_saved_policy() {
 		valid_uuid "$uuid" || continue
 		"${tool_env[@]}" "$nmcli" connection modify uuid "$uuid" \
 			802-11-wireless.powersave 2 connection.autoconnect yes \
-			connection.autoconnect-retries 0 >/dev/null
+			connection.autoconnect-retries 0 ipv6.method disabled >/dev/null
 	done < <(wifi_profile_uuids)
 }
 
@@ -468,7 +468,7 @@ connect_access_point() {
 	if [[ -n $active ]]; then
 		"${tool_env[@]}" "$nmcli" connection modify uuid "$active" \
 			802-11-wireless.powersave 2 connection.autoconnect yes \
-			connection.autoconnect-retries 0 >/dev/null
+			connection.autoconnect-retries 0 ipv6.method disabled >/dev/null
 	fi
 }
 

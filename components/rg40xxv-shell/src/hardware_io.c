@@ -130,6 +130,159 @@ DIR *hw_open_directory(const char *path)
 	return directory;
 }
 
+DIR *hw_discovery_open_directory(struct hardware_backend *backend,
+				 const char *path)
+{
+	if (backend != NULL && backend->discovery_scan_count != UINT64_MAX)
+		++backend->discovery_scan_count;
+	return hw_open_directory(path);
+}
+
+void hw_discovery_cache_reset(struct hardware_backend *backend)
+{
+	if (backend == NULL)
+		return;
+	memset(backend->discovery_cache, 0, sizeof(backend->discovery_cache));
+	backend->discovery_generation = 0;
+}
+
+void hw_discovery_begin_refresh(struct hardware_backend *backend)
+{
+	if (backend == NULL)
+		return;
+	if (backend->discovery_generation == UINT64_MAX) {
+		hw_discovery_cache_reset(backend);
+		backend->discovery_generation = 1;
+	} else {
+		++backend->discovery_generation;
+	}
+}
+
+static struct hardware_discovery_cache_entry *discovery_entry(
+	struct hardware_backend *backend, enum hw_discovery_slot slot)
+{
+	if (backend == NULL || slot < 0 || slot >= HW_DISCOVERY_SLOT_COUNT)
+		return NULL;
+	return &backend->discovery_cache[slot];
+}
+
+void hw_discovery_forget(struct hardware_backend *backend,
+			 enum hw_discovery_slot slot)
+{
+	struct hardware_discovery_cache_entry *entry = discovery_entry(backend, slot);
+
+	if (entry != NULL)
+		memset(entry, 0, sizeof(*entry));
+}
+
+int hw_discovery_cached_device(struct hardware_backend *backend,
+			       enum hw_discovery_slot slot, const char *root,
+			       char *name, size_t size, char *leaf,
+			       size_t leaf_size)
+{
+	struct hardware_discovery_cache_entry *entry = discovery_entry(backend, slot);
+	struct stat status;
+	struct stat leaf_status;
+	char path[PATH_MAX];
+	char leaf_path[PATH_MAX];
+	int length;
+
+	if (entry == NULL || entry->state != 1 || root == NULL || name == NULL ||
+	    size == 0 || !hw_valid_component(entry->device))
+		return -1;
+	length = snprintf(path, sizeof(path), "%s/%s", root, entry->device);
+	if (length < 0 || (size_t)length >= sizeof(path) || stat(path, &status) != 0 ||
+	    !S_ISDIR(status.st_mode) ||
+	    (unsigned int)(status.st_mode & S_IFMT) != entry->mode_type ||
+	    (uint64_t)status.st_dev != entry->device_id ||
+	    (uint64_t)status.st_ino != entry->inode) {
+		hw_discovery_forget(backend, slot);
+		return -1;
+	}
+	if (entry->leaf[0] != '\0' &&
+	    (hw_device_path(leaf_path, sizeof(leaf_path), root, entry->device,
+			    entry->leaf) != 0 || stat(leaf_path, &leaf_status) != 0 ||
+	     !S_ISREG(leaf_status.st_mode) ||
+	     (unsigned int)(leaf_status.st_mode & S_IFMT) != entry->leaf_mode_type ||
+	     (uint64_t)leaf_status.st_dev != entry->leaf_device_id ||
+	     (uint64_t)leaf_status.st_ino != entry->leaf_inode)) {
+		hw_discovery_forget(backend, slot);
+		return -1;
+	}
+	if (snprintf(name, size, "%s", entry->device) >= (int)size)
+		return -1;
+	if (leaf != NULL && leaf_size > 0 &&
+	    snprintf(leaf, leaf_size, "%s", entry->leaf) >= (int)leaf_size)
+		return -1;
+	return 0;
+}
+
+int hw_discovery_should_scan(const struct hardware_backend *backend,
+			     enum hw_discovery_slot slot)
+{
+	const struct hardware_discovery_cache_entry *entry;
+
+	if (backend == NULL || slot < 0 || slot >= HW_DISCOVERY_SLOT_COUNT)
+		return 0;
+	entry = &backend->discovery_cache[slot];
+	return entry->state == 0 ||
+		(entry->state < 0 &&
+		 backend->discovery_generation >= entry->retry_generation);
+}
+
+int hw_discovery_remember(struct hardware_backend *backend,
+			  enum hw_discovery_slot slot, const char *root,
+			  const char *name, const char *leaf)
+{
+	struct hardware_discovery_cache_entry *entry = discovery_entry(backend, slot);
+	struct stat status;
+	struct stat leaf_status;
+	char path[PATH_MAX];
+	char leaf_path[PATH_MAX];
+	int length;
+
+	if (entry == NULL || root == NULL || !hw_valid_component(name) ||
+	    (leaf != NULL && leaf[0] != '\0' && !hw_valid_component(leaf)))
+		return -1;
+	length = snprintf(path, sizeof(path), "%s/%s", root, name);
+	if (length < 0 || (size_t)length >= sizeof(path) || stat(path, &status) != 0 ||
+	    !S_ISDIR(status.st_mode))
+		return -1;
+	if (leaf != NULL && leaf[0] != '\0' &&
+	    (hw_device_path(leaf_path, sizeof(leaf_path), root, name, leaf) != 0 ||
+	     stat(leaf_path, &leaf_status) != 0 || !S_ISREG(leaf_status.st_mode)))
+		return -1;
+	memset(entry, 0, sizeof(*entry));
+	(void)snprintf(entry->device, sizeof(entry->device), "%s", name);
+	if (leaf != NULL) {
+		(void)snprintf(entry->leaf, sizeof(entry->leaf), "%s", leaf);
+		if (leaf[0] != '\0') {
+			entry->leaf_device_id = (uint64_t)leaf_status.st_dev;
+			entry->leaf_inode = (uint64_t)leaf_status.st_ino;
+			entry->leaf_mode_type =
+				(unsigned int)(leaf_status.st_mode & S_IFMT);
+		}
+	}
+	entry->device_id = (uint64_t)status.st_dev;
+	entry->inode = (uint64_t)status.st_ino;
+	entry->mode_type = (unsigned int)(status.st_mode & S_IFMT);
+	entry->state = 1;
+	return 0;
+}
+
+void hw_discovery_mark_missing(struct hardware_backend *backend,
+			       enum hw_discovery_slot slot)
+{
+	struct hardware_discovery_cache_entry *entry = discovery_entry(backend, slot);
+
+	if (entry == NULL)
+		return;
+	memset(entry, 0, sizeof(*entry));
+	entry->state = -1;
+	entry->retry_generation = backend->discovery_generation > UINT64_MAX - 60 ?
+		UINT64_MAX : backend->discovery_generation + 60;
+}
+
 int hw_valid_component(const char *name)
 {
 	size_t index;

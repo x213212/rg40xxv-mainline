@@ -5,11 +5,13 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -93,14 +95,133 @@ int launcher_request_validate(const struct launcher_request *request)
 	return 0;
 }
 
+static int write_all(int fd, const char *payload, size_t size)
+{
+	while (size > 0U) {
+		ssize_t written = write(fd, payload, size);
+
+		if (written < 0 && errno == EINTR)
+			continue;
+		if (written <= 0)
+			return errno != 0 ? errno : EIO;
+		payload += written;
+		size -= (size_t)written;
+	}
+	return 0;
+}
+
+static int sync_parent_directory(const char *path)
+{
+	char directory[PATH_MAX];
+	char *slash;
+	int fd;
+	int error = 0;
+
+	if (strlen(path) >= sizeof(directory))
+		return ENAMETOOLONG;
+	(void)snprintf(directory, sizeof(directory), "%s", path);
+	slash = strrchr(directory, '/');
+	if (slash == NULL)
+		(void)snprintf(directory, sizeof(directory), ".");
+	else if (slash == directory)
+		directory[1] = '\0';
+	else
+		*slash = '\0';
+	fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return errno;
+	if (fsync(fd) != 0)
+		error = errno;
+	if (close(fd) != 0 && error == 0)
+		error = errno;
+	return error;
+}
+
+int launcher_handoff_write(const char *path,
+			   const struct launcher_request *request)
+{
+	static const char schema[] = "schema=rg40xxv-launch-handoff-v1\n";
+	char temporary[PATH_MAX] = { 0 };
+	char *payload = NULL;
+	size_t payload_size;
+	size_t route_length;
+	size_t platform_length;
+	size_t content_length;
+	int payload_length;
+	int fd = -1;
+	int error;
+	int temporary_length;
+
+	if (!valid_path_text(path))
+		return EINVAL;
+	error = launcher_request_validate(request);
+	if (error != 0)
+		return error;
+	route_length = strlen(request->route);
+	platform_length = strlen(request->platform);
+	content_length = strlen(request->content);
+	if (route_length > 96U || platform_length > 64U)
+		return E2BIG;
+	if (SIZE_MAX - sizeof(schema) < route_length ||
+	    SIZE_MAX - sizeof(schema) - route_length < platform_length ||
+	    SIZE_MAX - sizeof(schema) - route_length - platform_length <
+		content_length + 32U)
+		return EOVERFLOW;
+	payload_size = sizeof(schema) + route_length + platform_length +
+		content_length + 32U;
+	payload = malloc(payload_size);
+	if (payload == NULL)
+		return ENOMEM;
+	payload_length = snprintf(payload, payload_size,
+		"%sroute=%s\nplatform=%s\ncontent=%s\n", schema,
+		request->route, request->platform, request->content);
+	if (payload_length < 0 || (size_t)payload_length >= payload_size) {
+		error = EOVERFLOW;
+		goto out;
+	}
+	temporary_length = snprintf(temporary, sizeof(temporary), "%s.tmp.%ld",
+		path, (long)getpid());
+	if (temporary_length < 0 ||
+	    (size_t)temporary_length >= sizeof(temporary)) {
+		error = ENAMETOOLONG;
+		goto out;
+	}
+	fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
+		  O_NOFOLLOW, 0600);
+	if (fd < 0) {
+		error = errno;
+		goto out;
+	}
+	error = fchmod(fd, 0600) == 0 ? 0 : errno;
+	if (error == 0)
+		error = write_all(fd, payload, (size_t)payload_length);
+	if (error == 0 && fsync(fd) != 0)
+		error = errno;
+	if (close(fd) != 0 && error == 0)
+		error = errno;
+	fd = -1;
+	if (error == 0 && rename(temporary, path) != 0)
+		error = errno;
+	if (error == 0)
+		error = sync_parent_directory(path);
+
+out:
+	if (fd >= 0)
+		(void)close(fd);
+	if (error != 0 && temporary[0] != '\0')
+		(void)unlink(temporary);
+	free(payload);
+	return error;
+}
+
 int stream_launcher_request_validate(
 	const struct stream_launcher_request *request)
 {
 	int error;
 
 	if (request == NULL || !valid_path_text(request->executable) ||
-	    !valid_argument_text(request->host) || request->width == 0U ||
-	    request->height == 0U || request->fps == 0U ||
+	    !valid_argument_text(request->host) || request->width != 640U ||
+	    request->height != 480U || request->fps == 0U ||
 	    request->bitrate_kbps == 0U ||
 	    !valid_token(request->codec, false) ||
 	    !valid_token(request->aspect, false) ||

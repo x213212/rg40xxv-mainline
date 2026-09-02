@@ -36,6 +36,15 @@ int main(void)
 	(void)power_lock_key(&state, 7, true, 2300U);
 	assert(state.unlock_progress == 1);
 	power_state_init(&state, false);
+	assert(power_idle_timeout_ms(&state, 1000U, 60000U, 1000U) == 60000);
+	assert(power_idle_timeout_ms(&state, 1000U, 60000U, 60999U) == 1);
+	assert(power_idle_timeout_ms(&state, 1000U, 60000U, 61000U) == 0);
+	action = power_auto_screen_off(&state);
+	assert(action == POWER_ACTION_BACKLIGHT_OFF);
+	assert(state.view == POWER_VIEW_SCREEN_OFF && !state.locked);
+	assert(power_idle_timeout_ms(&state, 1000U, 60000U, 61000U) == -1);
+	short_power(&state, 61100U);
+	assert(state.view == POWER_VIEW_ACTIVE);
 	short_power(&state, 1000U);
 	assert(state.view == POWER_VIEW_SCREEN_OFF && !state.locked);
 	short_power(&state, 1200U);

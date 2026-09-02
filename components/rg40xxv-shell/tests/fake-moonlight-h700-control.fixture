@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+: "${FAKE_MOONLIGHT_H700_CAPTURE:?}"
+printf '<%s>\n' "$@" >"$FAKE_MOONLIGHT_H700_CAPTURE"

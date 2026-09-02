@@ -2,7 +2,7 @@
 set -eu
 
 project=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-workspace=$(CDPATH= cd -- "$project/../.." && pwd -P)
+workspace=${RG40XXV_WORKSPACE:-$(CDPATH= cd -- "$project/../../../.." && pwd -P)}
 rootfs="$workspace/firmware/mnt/rootfs"
 temporary=$(mktemp -d)
 trap 'status=$?; trap - EXIT; rm -rf -- "$temporary"; exit "$status"' \
@@ -18,6 +18,9 @@ sanitizer_flags="-fsanitize=address,undefined -fno-sanitize-recover=all -static-
 # Native deterministic latch/snapshot coverage includes held A, axis state,
 # tick wrap, incomplete ioctl snapshots, and fail-closed retry.
 "$project/tests/test-input-latch.sh"
+# The native texture test probes LSan first.  If the managed runner denies its
+# stop-the-world ptrace, it retains ASan/UBSan and admits Memcheck only after a
+# deliberate-leak negative control; it also balances every fixture allocation.
 "$project/tests/test-texture-lifetime.sh"
 
 # shellcheck disable=SC2086
@@ -38,25 +41,41 @@ sanitizer_flags="-fsanitize=address,undefined -fno-sanitize-recover=all -static-
 asan_options=detect_leaks=0:halt_on_error=1:abort_on_error=1
 ubsan_options=halt_on_error=1:print_stacktrace=1
 fixture_bmp="$temporary/large-cover.bmp"
+mkdir "$temporary/cover-cache"
 ASAN_OPTIONS=$asan_options UBSAN_OPTIONS=$ubsan_options \
+	SDL_VIDEODRIVER=dummy \
 	qemu-aarch64-static -L "$rootfs" \
 	"$temporary/cover-worker-lifecycle" "$fixture_bmp" \
+	"$temporary/cover-cache" \
 	>"$temporary/worker.stdout" 2>"$temporary/worker.stderr"
 grep -Fq 'COVER_WORKER_LIFECYCLE_TEST PASS' "$temporary/worker.stdout"
 
+ui_sources=
+for source in "$project"/src/*.c; do
+	case $source in
+	*/main.c) ;;
+	*) ui_sources="$ui_sources $source" ;;
+	esac
+done
+
+# Build the normal UI through a test-only main wrapper.  It is inert unless
+# RG40XXV_TEST_CATEGORY_SWITCH=1 and avoids adding an automation hook to the
+# production binary.
 # shellcheck disable=SC2086
-"$cc" $common_flags -Wno-error=format-truncation $sanitizer_flags \
+"$cc" $common_flags -Wno-error=format-truncation $sanitizer_flags -pthread \
 	-I"$project/include" \
 	-I"$workspace/services/netstream/include" \
 	-idirafter "$rootfs/usr/include" \
 	-I"$rootfs/usr/include/SDL2" \
-	"$project"/src/*.c \
+	"$project/tests/category_switch_driver.c" \
+	$ui_sources \
 	"$workspace/services/netstream/src/netstream.c" \
 	"$rootfs/usr/lib/aarch64-linux-gnu/libasound.so" \
 	"$rootfs/usr/lib/aarch64-linux-gnu/libSDL2_ttf.so" \
 	"$rootfs/usr/lib/aarch64-linux-gnu/libSDL2_image.so" \
 	"$rootfs/usr/lib/aarch64-linux-gnu/libSDL2.so" \
 	-Wl,-rpath-link,"$rootfs/usr/lib/aarch64-linux-gnu" \
+	-Wl,--wrap=render_scene \
 	-lm \
 	-o "$temporary/rg40xxv-shell-sanitized"
 
@@ -72,6 +91,9 @@ while test "$i" -lt 32; do
 done
 cp "$project/tests/fake-launcher.fixture" "$temporary/fake-launcher.sh"
 chmod 0755 "$temporary/fake-launcher.sh"
+cp "$project/tests/stream-discovery-empty.fixture" \
+	"$temporary/stream-discovery.fixture"
+chmod 0600 "$temporary/stream-discovery.fixture"
 
 run_ui()
 {
@@ -79,6 +101,7 @@ run_ui()
 	shift
 	ASAN_OPTIONS=$asan_options UBSAN_OPTIONS=$ubsan_options \
 	SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+	RG40XXV_STREAM_DISCOVERY_FIXTURE="$temporary/stream-discovery.fixture" \
 	LAUNCH_CAPTURE="$temporary/$label.arguments" FAKE_EVENT_MARKER=1 \
 	qemu-aarch64-static -L "$rootfs" \
 		"$temporary/rg40xxv-shell-sanitized" \
@@ -98,6 +121,7 @@ run_ui()
 		"$@" \
 		>"$temporary/$label.stdout" 2>"$temporary/$label.stderr"
 	grep -Fq 'UI_RESULT PASS' "$temporary/$label.stdout"
+	grep -Fq 'renderer=software' "$temporary/$label.stdout"
 	if grep -Eq 'ERROR: AddressSanitizer|runtime error:' \
 		"$temporary/$label.stdout" "$temporary/$label.stderr"; then
 		printf '%s\n' "sanitizer finding in $label" >&2
@@ -131,6 +155,22 @@ while test "$system" -lt 190; do
 done
 run_ui filter-panel --filter-stress --demo-ms 4200
 
+# Exercise the actual top-nav path through Recent, Library, Favorites, RPG,
+# Streaming, Apps, Network, and Settings in one renderer lifetime.  The RPG
+# page is intentionally empty in this fixture; the wrapper proves that fixed
+# tab still renders and that its independent catalog view leaks no GBA items.
+RG40XXV_TEST_CATEGORY_SWITCH=1 run_ui category-tabs --demo-ms 5000
+grep -Fq 'CATEGORY_SWITCH_DRIVER PASS switches=73 pages=0xff rpg_empty=yes rpg_filter=PASS' \
+	"$temporary/category-tabs.stdout"
+
+# Keep a resident, input-idle UI alive across several one-second static
+# redraws and hardware-monitor publications.
+run_ui idle-resident --resident --demo-ms 3600
+idle_frames=$(sed -n 's/.* frames=\([0-9][0-9]*\).*/\1/p' \
+	"$temporary/idle-resident.stdout")
+test -n "$idle_frames"
+test "$idle_frames" -ge 4
+
 # Exercise real input_init -> suspend -> input_init reacquire without the
 # benchmark-only force-ready path.
 run_ui neutral-latch-lifecycle --launch-once --demo-ms 1500
@@ -153,5 +193,5 @@ while test "$lifecycle" -le 4; do
 	lifecycle=$((lifecycle + 1))
 done
 
-printf 'ARM64 ASan+UBSan navigation/lifecycle: PASS stale=%s cancelled=%s visible_evictions=%s cycles=%s\n' \
-	"$stale" "$cancelled" "$visible_evictions" "$lifecycle"
+printf 'ARM64 ASan+UBSan navigation/lifecycle: PASS stale=%s cancelled=%s visible_evictions=%s launch_cycles=%s category_switches=73 idle_frames=%s renderer=software\n' \
+	"$stale" "$cancelled" "$visible_evictions" "$lifecycle" "$idle_frames"

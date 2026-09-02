@@ -11,6 +11,7 @@
 
 #define HARDWARE_UNAVAILABLE (-1)
 #define HARDWARE_TEXT_UNAVAILABLE "unavailable"
+#define HARDWARE_DISCOVERY_CACHE_MAX 5
 
 enum hardware_network_state {
 	HARDWARE_NETWORK_UNAVAILABLE = -1,
@@ -129,6 +130,20 @@ struct hardware_persistence_ops {
 	int (*save_rgb_percent)(void *context, int percent);
 };
 
+/* Fixed-size, process-local cache for stable sysfs class discoveries. */
+struct hardware_discovery_cache_entry {
+	char device[64];
+	char leaf[32];
+	uint64_t device_id;
+	uint64_t inode;
+	uint64_t leaf_device_id;
+	uint64_t leaf_inode;
+	uint64_t retry_generation;
+	unsigned int mode_type;
+	unsigned int leaf_mode_type;
+	int state;
+};
+
 /*
  * All hardware discovery is read-only.  fixture_root is owned by the backend
  * so argv or test-temporary lifetimes cannot leave dangling root pointers.
@@ -138,14 +153,20 @@ struct hardware_backend {
 	char storage_path[PATH_MAX];
 	int fixture_mode;
 	struct hardware_persistence_ops persistence;
+	uint64_t discovery_generation;
+	uint64_t discovery_scan_count;
+	struct hardware_discovery_cache_entry
+		discovery_cache[HARDWARE_DISCOVERY_CACHE_MAX];
 };
 
 void hardware_backend_init(struct hardware_backend *backend);
 int hardware_backend_set_fixture_root(struct hardware_backend *backend,
 				      const char *root);
 void hardware_snapshot_init(struct hardware_snapshot *snapshot);
-int hardware_refresh(const struct hardware_backend *backend,
+int hardware_refresh(struct hardware_backend *backend,
 		     struct hardware_snapshot *snapshot, int include_wifi);
+uint64_t hardware_backend_discovery_scans(
+	const struct hardware_backend *backend);
 int hardware_rgb_load_setting(const struct hardware_backend *backend,
 			      int *percent);
 int hardware_rgb_save_setting(const struct hardware_backend *backend,

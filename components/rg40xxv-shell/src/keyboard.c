@@ -60,7 +60,7 @@ bool keyboard_handle_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 	const char *selected;
 
 	(void)now;
-	if (!ui->search_active)
+	if (!ui->search_active && !ui->network.password_active)
 		return false;
 	switch (key) {
 	case SDLK_UP: move_cursor(ui, -1, 0); break;
@@ -71,6 +71,8 @@ bool keyboard_handle_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 		selected = key_label(ui, ui->keyboard_row, ui->keyboard_column, shifted);
 		if (ui->input_method.layout == INPUT_METHOD_NEW_CHEWING)
 			(void)input_method_compose(&ui->input_method, selected);
+		else if (ui->network.password_active)
+			(void)network_ui_password_append(ui, selected);
 		else
 			search_append(ui, selected);
 		audio_play_chime(ui, 1870.0);
@@ -80,20 +82,30 @@ bool keyboard_handle_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 		    ui->input_method.candidate_count > 0U) {
 			search_append(ui, ui->input_method.candidates[0].text);
 			input_method_reset(&ui->input_method);
-		} else
+		} else if (ui->network.password_active)
+			network_ui_password_submit(ui, now);
+		else
 			search_close(ui);
 		break;
 	case SDLK_BACKSPACE:
 		if (ui->input_method.layout == INPUT_METHOD_NEW_CHEWING &&
 		    ui->input_method.composition[0] != '\0')
 			(void)input_method_backspace(&ui->input_method);
+		else if (ui->network.password_active)
+			network_ui_password_backspace(ui);
 		else if (ui->catalog.query[0] != '\0')
 			search_backspace(ui);
 		else
 			search_close(ui);
 		break;
 	case SDLK_ESCAPE:
-		search_close(ui);
+		if (ui->network.password_active &&
+		    ui->network.password[0] != '\0')
+			network_ui_password_backspace(ui);
+		else if (ui->network.password_active)
+			network_ui_password_cancel(ui);
+		else
+			search_close(ui);
 		break;
 	case SDLK_F1:
 	case SDLK_LSHIFT:
@@ -108,10 +120,14 @@ bool keyboard_handle_key(struct ui *ui, SDL_Keycode key, uint32_t now)
 		audio_play_chime(ui, 1710.0);
 		break;
 	case SDLK_F3:
-		ui->catalog.search_all_systems = !ui->catalog.search_all_systems;
-		catalog_apply_filters(ui);
-		persistence_request_filters(ui);
-		audio_play_chime(ui, 1780.0);
+		if (ui->network.password_active) {
+			network_ui_password_cancel(ui);
+		} else {
+			ui->catalog.search_all_systems = !ui->catalog.search_all_systems;
+			catalog_apply_filters(ui);
+			persistence_request_filters(ui);
+			audio_play_chime(ui, 1780.0);
+		}
 		break;
 	default: break;
 	}
@@ -142,18 +158,26 @@ void keyboard_render(struct ui *ui)
 		UI_LAYOUT_CONTENT_WIDTH, 169, panel);
 	render_outline_rect(ui->renderer, UI_LAYOUT_CONTENT_X, 258,
 		UI_LAYOUT_CONTENT_WIDTH, 169, line);
-	text_draw(ui, 0, layout_label(ui), 28, 266, text);
+	text_draw(ui, 0, ui->network.password_active ?
+		tr(ui, "network_password_entry") : layout_label(ui), 28, 266, text);
 	if (ui->input_method.layout == INPUT_METHOD_NEW_CHEWING) {
 		const char *candidate = ui->input_method.candidate_count == 0U ? "" :
 			ui->input_method.candidates[0].text;
 
 		text_draw(ui, 0, ui->input_method.composition, 212, 266, text);
 		text_draw(ui, 0, candidate, 382, 266, muted);
+	} else if (ui->network.password_active) {
+		char masked[NETWORK_UI_PASSWORD_SIZE];
+
+		(void)input_method_mask_password(ui->network.password, masked,
+			sizeof(masked));
+		text_draw(ui, 0, masked, 260, 266, text);
 	} else
 		text_draw(ui, 0, tr(ui, ui->input_method.backend.available ?
 			  "new_chewing_ready" : "ime_english_short"), 260, 266, muted);
-	text_draw(ui, 0, tr(ui, ui->catalog.search_all_systems ?
-		  "scope_all_short" : "scope_current_short"), 536, 266, muted);
+	if (!ui->network.password_active)
+		text_draw(ui, 0, tr(ui, ui->catalog.search_all_systems ?
+			  "scope_all_short" : "scope_current_short"), 536, 266, muted);
 	for (int row = 0; row < KEYBOARD_ROWS; ++row) {
 		for (int column = 0; column < KEYBOARD_COLUMNS; ++column) {
 			char shifted[8];
@@ -176,5 +200,7 @@ void keyboard_render(struct ui *ui)
 				  active ? selected_color : text);
 		}
 	}
-	text_draw(ui, 0, tr(ui, "keyboard_controls_new"), 28, 409, muted);
+	text_draw(ui, 0, tr(ui, ui->network.password_active ?
+		"network_keyboard_controls" : "keyboard_controls_new"),
+		28, 409, muted);
 }

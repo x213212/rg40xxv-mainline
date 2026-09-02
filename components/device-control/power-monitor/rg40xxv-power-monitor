@@ -1,0 +1,560 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export LC_ALL=C
+
+ROOT_PREFIX=${RG40XXV_POWER_MONITOR_ROOT:-}
+SYS_ROOT="$ROOT_PREFIX/sys"
+PROC_ROOT=${RG40XXV_POWER_MONITOR_PROC_ROOT:-$ROOT_PREFIX/proc}
+POWER_ROOT="$SYS_ROOT/class/power_supply"
+CPU_ROOT="$SYS_ROOT/devices/system/cpu/cpufreq"
+GPU_ROOT="$SYS_ROOT/class/devfreq"
+BACKLIGHT_ROOT="$SYS_ROOT/class/backlight"
+REGULATOR_ROOT="$SYS_ROOT/class/regulator"
+
+usage() {
+	cat <<'EOF'
+用法：rg40xxv-power-monitor COMMAND [參數]
+
+  once                    顯示一次完整快照（預設）
+  watch [秒數] [次數]     持續顯示；預設 2 秒，0 次代表無限
+  csv [秒數] [次數]       CSV 輸出；預設只取 1 次
+  trend [秒數] [次數]     以 VBAT 線性回歸估算趨勢；預設 5 秒 × 60 次
+  diagnose                顯示快照及目前 CPU 用量最高的程序
+  sources                 列出每個數值的實際 sysfs 來源
+
+這個工具只讀取 sysfs/procfs，不寫 PMIC、電壓、頻率或 p7/p8。
+AXP717 current_now 是未校準 raw 值，不能當成精確整機耗電。
+EOF
+}
+
+read_attr() {
+	local path=$1 value resolved
+	[[ -r $path && -f $path && ! -L $path ]] || return 1
+	case $path in
+		"$SYS_ROOT"/*)
+			resolved=$(realpath -e -- "$path" 2>/dev/null) || return 1
+			[[ $resolved == "$SYS_ROOT"/* ]] || return 1
+			;;
+		"$PROC_ROOT"/*) ;;
+		*) return 1 ;;
+	esac
+	value=$(<"$path") || return 1
+	[[ $value != *$'\r'* && $value != *$'\n'* ]] || return 1
+	[[ -n $value ]] || return 1
+	printf '%s' "$value"
+}
+
+read_integer() {
+	local path=$1 minimum=$2 maximum=$3 value
+	value=$(read_attr "$path") || return 1
+	[[ $value =~ ^-?[0-9]+$ ]] || return 1
+	((value >= minimum && value <= maximum)) || return 1
+	printf '%s' "$value"
+}
+
+find_supply() {
+	local wanted=$1 directory type
+	for directory in "$POWER_ROOT"/*; do
+		[[ -d $directory || -L $directory ]] || continue
+		type=$(read_attr "$directory/type" 2>/dev/null || true)
+		[[ $type == "$wanted" ]] || continue
+		printf '%s' "$directory"
+		return 0
+	done
+	return 1
+}
+
+find_first_entry() {
+	local root=$1 entry
+	for entry in "$root"/*; do
+		[[ -d $entry || -L $entry ]] || continue
+		printf '%s' "$entry"
+		return 0
+	done
+	return 1
+}
+
+find_gpu() {
+	local entry name identity
+	for entry in "$GPU_ROOT"/*; do
+		[[ -d $entry || -L $entry ]] || continue
+		name=$(read_attr "$entry/name" 2>/dev/null || true)
+		identity="${entry##*/} $name"
+		[[ ${identity,,} == *gpu* ]] || continue
+		printf '%s' "$entry"
+		return 0
+	done
+	return 1
+}
+
+find_cpu_regulator() {
+	local entry name lowered
+	for entry in "$REGULATOR_ROOT"/*; do
+		[[ -d $entry || -L $entry ]] || continue
+		name=$(read_attr "$entry/name" 2>/dev/null || true)
+		lowered=${name,,}
+		case "$lowered" in
+			*vdd-cpu*|*vdd_cpu*|*cpu\ vcore*|*cpu\ voltage*|cpu)
+				[[ -r $entry/microvolts ]] || continue
+				printf '%s' "$entry"
+				return 0
+				;;
+		esac
+	done
+	return 1
+}
+
+format_scaled() {
+	local value=$1 scale=$2 sign= absolute whole fraction
+	[[ $value =~ ^-?[0-9]+$ ]] || {
+		printf 'NA'
+		return
+	}
+	if ((value < 0)); then
+		sign=-
+		absolute=$((-value))
+	else
+		absolute=$value
+	fi
+	whole=$((absolute / scale))
+	fraction=$(((absolute % scale) * 1000 / scale))
+	printf '%s%d.%03d' "$sign" "$whole" "$fraction"
+}
+
+format_with_unit() {
+	local value=$1 scale=$2 unit=$3
+	if [[ $value =~ ^-?[0-9]+$ ]]; then
+		printf '%s%s' "$(format_scaled "$value" "$scale")" "$unit"
+	else
+		printf 'NA'
+	fi
+}
+
+power_direction() {
+	case ${1,,} in
+		charging) printf 'charging' ;;
+		discharging) printf 'discharging' ;;
+		full) printf 'full' ;;
+		'not charging') printf 'external-or-idle' ;;
+		*) printf 'unknown' ;;
+	esac
+}
+
+join_cpu_policies() {
+	local policy name current governor separator= summary= maximum=NA
+	for policy in "$CPU_ROOT"/policy*; do
+		[[ -d $policy || -L $policy ]] || continue
+		name=${policy##*/}
+		current=$(read_integer "$policy/scaling_cur_freq" 1 10000000 2>/dev/null || printf 'NA')
+		governor=$(read_attr "$policy/scaling_governor" 2>/dev/null || printf 'NA')
+		summary+="${separator}${name}:${current}:${governor}"
+		separator='|'
+		if [[ $current =~ ^[0-9]+$ ]] && { [[ $maximum == NA ]] || ((current > maximum)); }; then
+			maximum=$current
+		fi
+	done
+	CPU_POLICIES=${summary:-NA}
+	CPU_MAX_KHZ=$maximum
+}
+
+snapshot() {
+	local gpu_name backlight_value uptime_text
+	SAMPLE_TIMESTAMP=$(date +'%Y-%m-%dT%H:%M:%S%:z')
+	SAMPLE_EPOCH=$(date +%s)
+	uptime_text=$(read_attr "$PROC_ROOT/uptime" 2>/dev/null || true)
+	if [[ $uptime_text =~ ^([0-9]+)(\.[0-9]+)?([[:space:]].*)?$ ]]; then
+		SAMPLE_MONOTONIC=${BASH_REMATCH[1]}
+	else
+		SAMPLE_MONOTONIC=$SAMPLE_EPOCH
+	fi
+	BOOT_ID=$(read_attr "$PROC_ROOT/sys/kernel/random/boot_id" 2>/dev/null || printf 'NA')
+
+	BATTERY_DIR=$(find_supply Battery 2>/dev/null || true)
+	USB_DIR=$(find_supply USB 2>/dev/null || true)
+	GPU_DIR=$(find_gpu 2>/dev/null || true)
+	BACKLIGHT_DIR=$(find_first_entry "$BACKLIGHT_ROOT" 2>/dev/null || true)
+	CPU_REGULATOR_DIR=$(find_cpu_regulator 2>/dev/null || true)
+
+	BATTERY_STATUS=$(read_attr "$BATTERY_DIR/status" 2>/dev/null || printf 'Unavailable')
+	BATTERY_CAPACITY=$(read_integer "$BATTERY_DIR/capacity" 0 100 2>/dev/null || printf 'NA')
+	BATTERY_VOLTAGE_UV=$(read_integer "$BATTERY_DIR/voltage_now" 0 10000000 2>/dev/null || printf 'NA')
+	BATTERY_CURRENT_RAW_UA=$(read_integer "$BATTERY_DIR/current_now" -10000000 10000000 2>/dev/null || printf 'NA')
+	BATTERY_DIRECTION=$(power_direction "$BATTERY_STATUS")
+
+	USB_ONLINE=$(read_integer "$USB_DIR/online" 0 1 2>/dev/null || printf 'NA')
+	USB_PRESENT=$(read_integer "$USB_DIR/present" 0 1 2>/dev/null || printf 'NA')
+	USB_VOLTAGE_UV=$(read_integer "$USB_DIR/voltage_now" 0 20000000 2>/dev/null || printf 'NA')
+	USB_INPUT_LIMIT_UA=$(read_integer "$USB_DIR/input_current_limit" 0 10000000 2>/dev/null || printf 'NA')
+	USB_TYPE=$(read_attr "$USB_DIR/usb_type" 2>/dev/null || printf 'NA')
+
+	join_cpu_policies
+	CPU_VOLTAGE_UV=$(read_integer "$CPU_REGULATOR_DIR/microvolts" 0 3000000 2>/dev/null || printf 'NA')
+
+	gpu_name=$(read_attr "$GPU_DIR/name" 2>/dev/null || true)
+	GPU_NAME=${gpu_name:-${GPU_DIR##*/}}
+	[[ -n $GPU_NAME ]] || GPU_NAME=NA
+	GPU_GOVERNOR=$(read_attr "$GPU_DIR/governor" 2>/dev/null || printf 'NA')
+	GPU_RUNTIME=$(read_attr "$GPU_DIR/power/runtime_status" 2>/dev/null || printf 'NA')
+	if [[ $GPU_RUNTIME == active ]]; then
+		GPU_FREQ_HZ=$(read_integer "$GPU_DIR/cur_freq" 0 5000000000 2>/dev/null || printf 'NA')
+	else
+		GPU_FREQ_HZ=NA
+	fi
+
+	backlight_value=$(read_integer "$BACKLIGHT_DIR/actual_brightness" 0 100000000 2>/dev/null || true)
+	if [[ -z $backlight_value ]]; then
+		backlight_value=$(read_integer "$BACKLIGHT_DIR/brightness" 0 100000000 2>/dev/null || printf 'NA')
+	fi
+	BACKLIGHT_VALUE=$backlight_value
+	BACKLIGHT_MAX=$(read_integer "$BACKLIGHT_DIR/max_brightness" 1 100000000 2>/dev/null || printf 'NA')
+	BACKLIGHT_POWER=$(read_integer "$BACKLIGHT_DIR/bl_power" 0 4 2>/dev/null || printf 'NA')
+
+	WIFI_STATE=$(read_attr "$SYS_ROOT/class/net/wlan0/operstate" 2>/dev/null || printf 'NA')
+	WIFI_RX_BYTES=$(read_integer "$SYS_ROOT/class/net/wlan0/statistics/rx_bytes" 0 9223372036854775807 2>/dev/null || printf 'NA')
+	WIFI_TX_BYTES=$(read_integer "$SYS_ROOT/class/net/wlan0/statistics/tx_bytes" 0 9223372036854775807 2>/dev/null || printf 'NA')
+	LOAD1=$(read_attr "$PROC_ROOT/loadavg" 2>/dev/null || true)
+	LOAD1=${LOAD1%% *}
+	[[ -n $LOAD1 ]] || LOAD1=NA
+}
+
+human_snapshot() {
+	snapshot
+	printf 'time=%s\n' "$SAMPLE_TIMESTAMP"
+	printf 'battery capacity=%s%% status=%s direction=%s voltage=%s raw_current=%s\n' \
+		"$BATTERY_CAPACITY" "$BATTERY_STATUS" "$BATTERY_DIRECTION" \
+		"$(format_with_unit "$BATTERY_VOLTAGE_UV" 1000000 V)" \
+		"$(format_with_unit "$BATTERY_CURRENT_RAW_UA" 1000000 A)"
+	printf 'usb online=%s present=%s type=%s voltage=%s input_limit=%s\n' \
+		"$USB_ONLINE" "$USB_PRESENT" \
+		"$USB_TYPE" \
+		"$(format_with_unit "$USB_VOLTAGE_UV" 1000000 V)" \
+		"$(format_with_unit "$USB_INPUT_LIMIT_UA" 1000000 A)"
+	printf 'cpu policies=%s core_voltage=%s load1=%s\n' \
+		"$CPU_POLICIES" "$(format_with_unit "$CPU_VOLTAGE_UV" 1000000 V)" "$LOAD1"
+	printf 'gpu name=%s frequency_hz=%s governor=%s runtime=%s\n' \
+		"$GPU_NAME" "$GPU_FREQ_HZ" "$GPU_GOVERNOR" "$GPU_RUNTIME"
+	printf 'display brightness=%s/%s bl_power=%s wifi=%s rx_bytes=%s tx_bytes=%s\n' \
+		"$BACKLIGHT_VALUE" "$BACKLIGHT_MAX" "$BACKLIGHT_POWER" "$WIFI_STATE" \
+		"$WIFI_RX_BYTES" "$WIFI_TX_BYTES"
+	printf 'note=raw_current is an uncalibrated AXP717 indicator; no wattage is calculated; use VBAT trend while USB is offline\n'
+}
+
+validate_interval_count() {
+	local interval=$1 count=$2 allow_zero_count=$3
+	[[ $interval =~ ^[0-9]+$ ]] && ((interval >= 1 && interval <= 3600)) || {
+		printf '錯誤：秒數必須是 1..3600 的整數\n' >&2
+		return 2
+	}
+	[[ $count =~ ^[0-9]+$ ]] || {
+		printf '錯誤：次數必須是非負整數\n' >&2
+		return 2
+	}
+	if ((allow_zero_count == 0 && count == 0)); then
+		printf '錯誤：此模式的次數必須大於 0\n' >&2
+		return 2
+	fi
+	((count <= 1000000)) || {
+		printf '錯誤：次數超過上限 1000000\n' >&2
+		return 2
+	}
+}
+
+update_regression() {
+	local elapsed
+	if ((TREND_N > 0)) && { [[ $USB_ONLINE != "$TREND_SEGMENT_USB" ]] || [[ $BATTERY_STATUS != "$TREND_SEGMENT_STATUS" ]]; }; then
+		TREND_EPOCH_TRANSITIONS=$((TREND_EPOCH_TRANSITIONS + 1))
+		reset_regression_segment
+	fi
+	elapsed=$((SAMPLE_MONOTONIC - TREND_START_MONOTONIC))
+	[[ $BATTERY_VOLTAGE_UV =~ ^[0-9]+$ ]] || return 0
+	TREND_N=$((TREND_N + 1))
+	TREND_SUM_T=$((TREND_SUM_T + elapsed))
+	TREND_SUM_V=$((TREND_SUM_V + BATTERY_VOLTAGE_UV))
+	TREND_SUM_TT=$((TREND_SUM_TT + elapsed * elapsed))
+	TREND_SUM_TV=$((TREND_SUM_TV + elapsed * BATTERY_VOLTAGE_UV))
+	[[ $TREND_FIRST_VOLTAGE == NA ]] && TREND_FIRST_VOLTAGE=$BATTERY_VOLTAGE_UV
+	TREND_LAST_VOLTAGE=$BATTERY_VOLTAGE_UV
+	[[ $TREND_FIRST_CAPACITY == NA && $BATTERY_CAPACITY != NA ]] && TREND_FIRST_CAPACITY=$BATTERY_CAPACITY
+	[[ $BATTERY_CAPACITY != NA ]] && TREND_LAST_CAPACITY=$BATTERY_CAPACITY
+	[[ $USB_ONLINE == 1 ]] && TREND_USB_ONLINE=1
+}
+
+regression_rate_tenths() {
+	local numerator denominator
+	((TREND_N >= 3)) || {
+		printf 'NA'
+		return
+	}
+	numerator=$((TREND_N * TREND_SUM_TV - TREND_SUM_T * TREND_SUM_V))
+	denominator=$((TREND_N * TREND_SUM_TT - TREND_SUM_T * TREND_SUM_T))
+	((denominator > 0)) || {
+		printf 'NA'
+		return
+	}
+	# slope is microvolts/second. Convert to tenths of a millivolt/minute.
+	printf '%d' "$((numerator * 3 / (denominator * 5)))"
+}
+
+format_tenths() {
+	local value=$1 sign= absolute
+	[[ $value =~ ^-?[0-9]+$ ]] || {
+		printf 'NA'
+		return
+	}
+	if ((value < 0)); then
+		sign=-
+		absolute=$((-value))
+	else
+		absolute=$value
+	fi
+	printf '%s%d.%d' "$sign" "$((absolute / 10))" "$((absolute % 10))"
+}
+
+reset_regression_segment() {
+	TREND_START_MONOTONIC=$SAMPLE_MONOTONIC
+	TREND_N=0
+	TREND_SUM_T=0
+	TREND_SUM_V=0
+	TREND_SUM_TT=0
+	TREND_SUM_TV=0
+	TREND_FIRST_VOLTAGE=NA
+	TREND_LAST_VOLTAGE=NA
+	TREND_FIRST_CAPACITY=NA
+	TREND_LAST_CAPACITY=NA
+	TREND_USB_ONLINE=0
+	TREND_SEGMENT_USB=$USB_ONLINE
+	TREND_SEGMENT_STATUS=$BATTERY_STATUS
+}
+
+reset_regression() {
+	TREND_EPOCH_TRANSITIONS=0
+	reset_regression_segment
+}
+
+watch_samples() {
+	local interval=$1 count=$2 index=0 rate
+	snapshot
+	reset_regression
+	printf 'time battery status vbat raw-current cpu-khz gpu-hz gpu-state backlight wifi trend-mV/min\n'
+	while ((count == 0 || index < count)); do
+		((index > 0)) && snapshot
+		update_regression
+		rate=$(regression_rate_tenths)
+		printf '%s %s%% %s %s %s %s %s %s %s/%s %s %s\n' \
+			"$SAMPLE_TIMESTAMP" "$BATTERY_CAPACITY" "$BATTERY_STATUS" \
+			"$(format_with_unit "$BATTERY_VOLTAGE_UV" 1000000 V)" \
+			"$(format_with_unit "$BATTERY_CURRENT_RAW_UA" 1000000 A)" \
+			"$CPU_MAX_KHZ" "$GPU_FREQ_HZ" "$GPU_RUNTIME" \
+			"$BACKLIGHT_VALUE" "$BACKLIGHT_MAX" "$WIFI_STATE" \
+			"$(format_tenths "$rate")"
+		((index += 1))
+		((count != 0 && index >= count)) && break
+		sleep "$interval"
+	done
+}
+
+csv_samples() {
+	local interval=$1 count=$2 index=0
+	printf 'timestamp,monotonic_s,boot_id,status,capacity_pct,battery_voltage_uv,battery_current_raw_ua,battery_current_quality,direction,usb_online,usb_present,usb_type,usb_voltage_uv,usb_input_limit_ua,cpu_max_khz,cpu_policies,cpu_voltage_uv,load1,gpu_freq_hz,gpu_governor,gpu_runtime,backlight,backlight_max,bl_power,wifi,wlan_rx_bytes,wlan_tx_bytes\n'
+	while ((index < count)); do
+		snapshot
+		printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+			"$SAMPLE_TIMESTAMP" "$SAMPLE_MONOTONIC" "$BOOT_ID" "$BATTERY_STATUS" \
+			"$BATTERY_CAPACITY" "$BATTERY_VOLTAGE_UV" "$BATTERY_CURRENT_RAW_UA" RAW_UNCALIBRATED \
+			"$BATTERY_DIRECTION" "$USB_ONLINE" "$USB_PRESENT" "$USB_TYPE" \
+			"$USB_VOLTAGE_UV" "$USB_INPUT_LIMIT_UA" "$CPU_MAX_KHZ" "$CPU_POLICIES" \
+			"$CPU_VOLTAGE_UV" "$LOAD1" "$GPU_FREQ_HZ" "$GPU_GOVERNOR" \
+			"$GPU_RUNTIME" "$BACKLIGHT_VALUE" "$BACKLIGHT_MAX" "$BACKLIGHT_POWER" \
+			"$WIFI_STATE" "$WIFI_RX_BYTES" "$WIFI_TX_BYTES"
+		((index += 1))
+		((index >= count)) || sleep "$interval"
+	done
+}
+
+trend_samples() {
+	local interval=$1 count=$2 index=0 rate elapsed
+	snapshot
+	reset_regression
+	while ((index < count)); do
+		((index > 0)) && snapshot
+		update_regression
+		printf '\r樣本 %d/%d  VBAT=%s  USB=%s  ' \
+			"$((index + 1))" "$count" \
+			"$(format_with_unit "$BATTERY_VOLTAGE_UV" 1000000 V)" "$USB_ONLINE" >&2
+		((index += 1))
+		((index >= count)) || sleep "$interval"
+	done
+	printf '\n' >&2
+	rate=$(regression_rate_tenths)
+	elapsed=$((SAMPLE_MONOTONIC - TREND_START_MONOTONIC))
+	printf 'POWER_TREND samples=%d elapsed_seconds=%d first_voltage_uv=%s last_voltage_uv=%s slope_mv_per_min=%s first_capacity_pct=%s last_capacity_pct=%s usb_seen_online=%s epoch_transitions=%s\n' \
+		"$TREND_N" "$elapsed" "$TREND_FIRST_VOLTAGE" "$TREND_LAST_VOLTAGE" \
+		"$(format_tenths "$rate")" "$TREND_FIRST_CAPACITY" "$TREND_LAST_CAPACITY" \
+		"$TREND_USB_ONLINE" "$TREND_EPOCH_TRANSITIONS"
+	if ((TREND_USB_ONLINE == 1)); then
+		printf 'POWER_TREND verdict=charging-or-usb-connected note=disconnect-USB-before-judging-battery-drain\n'
+	else
+		printf 'POWER_TREND verdict=battery-only note=voltage-is-nonlinear-use-a-longer-run-and-capacity-trend\n'
+	fi
+}
+
+show_sources() {
+	local policy
+	BATTERY_DIR=$(find_supply Battery 2>/dev/null || true)
+	USB_DIR=$(find_supply USB 2>/dev/null || true)
+	GPU_DIR=$(find_gpu 2>/dev/null || true)
+	BACKLIGHT_DIR=$(find_first_entry "$BACKLIGHT_ROOT" 2>/dev/null || true)
+	CPU_REGULATOR_DIR=$(find_cpu_regulator 2>/dev/null || true)
+	printf 'battery.capacity=%s\n' "${BATTERY_DIR:-UNAVAILABLE}/capacity"
+	printf 'battery.status=%s\n' "${BATTERY_DIR:-UNAVAILABLE}/status"
+	printf 'battery.voltage_uv=%s\n' "${BATTERY_DIR:-UNAVAILABLE}/voltage_now"
+	printf 'battery.current_raw_ua=%s\n' "${BATTERY_DIR:-UNAVAILABLE}/current_now"
+	printf 'battery.current_raw_ua.quality=RAW_UNCALIBRATED\n'
+	printf 'usb.online=%s\n' "${USB_DIR:-UNAVAILABLE}/online"
+	printf 'usb.voltage_uv=%s\n' "${USB_DIR:-UNAVAILABLE}/voltage_now"
+	printf 'usb.input_limit_ua=%s\n' "${USB_DIR:-UNAVAILABLE}/input_current_limit"
+	printf 'usb.input_limit_ua.quality=CONFIGURED_LIMIT_NOT_MEASURED_CURRENT\n'
+	printf 'usb.type=%s\n' "${USB_DIR:-UNAVAILABLE}/usb_type"
+	for policy in "$CPU_ROOT"/policy*; do
+		[[ -d $policy || -L $policy ]] || continue
+		printf 'cpu.%s.frequency_khz=%s/scaling_cur_freq\n' "${policy##*/}" "$policy"
+		printf 'cpu.%s.governor=%s/scaling_governor\n' "${policy##*/}" "$policy"
+	done
+	printf 'cpu.core_voltage_uv=%s\n' "${CPU_REGULATOR_DIR:-UNAVAILABLE}/microvolts"
+	printf 'gpu.frequency_hz=%s\n' "${GPU_DIR:-UNAVAILABLE}/cur_freq"
+	printf 'gpu.runtime=%s\n' "${GPU_DIR:-UNAVAILABLE}/power/runtime_status"
+	printf 'display.brightness=%s\n' "${BACKLIGHT_DIR:-UNAVAILABLE}/actual_brightness"
+	printf 'wifi.state=%s/class/net/wlan0/operstate\n' "$SYS_ROOT"
+	printf 'wifi.rx_bytes=%s/class/net/wlan0/statistics/rx_bytes\n' "$SYS_ROOT"
+	printf 'wifi.tx_bytes=%s/class/net/wlan0/statistics/tx_bytes\n' "$SYS_ROOT"
+	printf 'warning.health=not-read-because-AXP717-health-read-clears-fault-bits\n'
+}
+
+show_top_processes() {
+	local cpu_before cpu_after cpu_delta cpu_count page_size page_kib
+	local stat_path stat_line pid command remainder key ticks start_time rss_pages
+	local delta percent_tenths rss_kib row
+	local -a fields rows=()
+	local -A first_ticks=() first_start=()
+	if [[ -n $ROOT_PREFIX ]]; then
+		printf 'processes=unavailable-in-fixture-mode\n'
+		return
+	fi
+	[[ -r $PROC_ROOT/stat ]] || {
+		printf 'processes=proc-stat-unavailable\n'
+		return
+	}
+	read -r _ cpu_user cpu_nice cpu_system cpu_idle cpu_iowait cpu_irq cpu_softirq cpu_steal _ <"$PROC_ROOT/stat"
+	cpu_before=$((cpu_user + cpu_nice + cpu_system + cpu_idle + cpu_iowait + cpu_irq + cpu_softirq + cpu_steal))
+	for stat_path in "$PROC_ROOT"/[0-9]*/stat; do
+		[[ -r $stat_path && -f $stat_path ]] || continue
+		stat_line=$(<"$stat_path") || continue
+		[[ $stat_line =~ ^([0-9]+)[[:space:]]+\((.*)\)[[:space:]]+[^[:space:]][[:space:]]+(.*)$ ]] || continue
+		pid=${BASH_REMATCH[1]}
+		command=${BASH_REMATCH[2]}
+		remainder=${BASH_REMATCH[3]}
+		read -r -a fields <<<"$remainder"
+		((${#fields[@]} >= 21)) || continue
+		[[ ${fields[10]} =~ ^[0-9]+$ && ${fields[11]} =~ ^[0-9]+$ && ${fields[18]} =~ ^[0-9]+$ ]] || continue
+		key="$pid:${fields[18]}"
+		first_ticks[$key]=$((${fields[10]} + ${fields[11]}))
+		first_start[$pid]=${fields[18]}
+	done
+	sleep 1
+	read -r _ cpu_user cpu_nice cpu_system cpu_idle cpu_iowait cpu_irq cpu_softirq cpu_steal _ <"$PROC_ROOT/stat"
+	cpu_after=$((cpu_user + cpu_nice + cpu_system + cpu_idle + cpu_iowait + cpu_irq + cpu_softirq + cpu_steal))
+	cpu_delta=$((cpu_after - cpu_before))
+	cpu_count=$(awk '/^cpu[0-9]+[[:space:]]/ { count++ } END { print count + 0 }' "$PROC_ROOT/stat")
+	((cpu_count > 0)) || cpu_count=1
+	page_size=$(getconf PAGESIZE 2>/dev/null || printf '4096')
+	[[ $page_size =~ ^[0-9]+$ ]] || page_size=4096
+	page_kib=$((page_size / 1024))
+	((cpu_delta > 0)) || {
+		printf 'processes=zero-cpu-counter-delta\n'
+		return
+	}
+	for stat_path in "$PROC_ROOT"/[0-9]*/stat; do
+		[[ -r $stat_path && -f $stat_path ]] || continue
+		stat_line=$(<"$stat_path") || continue
+		[[ $stat_line =~ ^([0-9]+)[[:space:]]+\((.*)\)[[:space:]]+[^[:space:]][[:space:]]+(.*)$ ]] || continue
+		pid=${BASH_REMATCH[1]}
+		((pid == $$)) && continue
+		command=${BASH_REMATCH[2]}
+		remainder=${BASH_REMATCH[3]}
+		read -r -a fields <<<"$remainder"
+		((${#fields[@]} >= 21)) || continue
+		[[ ${fields[10]} =~ ^[0-9]+$ && ${fields[11]} =~ ^[0-9]+$ && ${fields[18]} =~ ^[0-9]+$ && ${fields[20]} =~ ^-?[0-9]+$ ]] || continue
+		start_time=${fields[18]}
+		[[ ${first_start[$pid]:-} == "$start_time" ]] || continue
+		key="$pid:$start_time"
+		[[ -v first_ticks[$key] ]] || continue
+		ticks=$((${fields[10]} + ${fields[11]}))
+		delta=$((ticks - first_ticks[$key]))
+		((delta > 0)) || continue
+		percent_tenths=$((delta * cpu_count * 1000 / cpu_delta))
+		rss_pages=${fields[20]}
+		((rss_pages < 0)) && rss_pages=0
+		rss_kib=$((rss_pages * page_kib))
+		command=${command//$'\t'/ }
+		command=${command//$'\n'/ }
+		row=$(printf '%012d\t%012d\t%012d\t%d\t%s' "$delta" "$rss_kib" "$pid" "$percent_tenths" "$command")
+		rows+=("$row")
+	done
+	printf 'top_processes_cpu_delta_1s:\n'
+	printf '  PID CPU%% RSS_KiB COMMAND\n'
+	if ((${#rows[@]} == 0)); then
+		printf '  (no process consumed a complete scheduler tick)\n'
+		return
+	fi
+	printf '%s\n' "${rows[@]}" | sort -t $'\t' -k1,1nr -k2,2nr -k3,3n | sed -n '1,8p' | \
+		while IFS=$'\t' read -r _ rss_kib pid percent_tenths command; do
+			printf '%5d %3d.%d %7d %s\n' "$((10#$pid))" "$((percent_tenths / 10))" "$((percent_tenths % 10))" "$((10#$rss_kib))" "$command"
+		done
+}
+
+command=${1:-once}
+case $command in
+	once)
+		(($# == 1 || $# == 0)) || { usage >&2; exit 2; }
+		human_snapshot
+		;;
+	watch)
+		interval=${2:-2}
+		count=${3:-0}
+		(($# <= 3)) || { usage >&2; exit 2; }
+		validate_interval_count "$interval" "$count" 1
+		watch_samples "$interval" "$count"
+		;;
+	csv)
+		interval=${2:-2}
+		count=${3:-1}
+		(($# <= 3)) || { usage >&2; exit 2; }
+		validate_interval_count "$interval" "$count" 0
+		csv_samples "$interval" "$count"
+		;;
+	trend)
+		interval=${2:-5}
+		count=${3:-60}
+		(($# <= 3)) || { usage >&2; exit 2; }
+		validate_interval_count "$interval" "$count" 0
+		((count >= 3)) || { printf '錯誤：trend 至少需要 3 個樣本\n' >&2; exit 2; }
+		trend_samples "$interval" "$count"
+		;;
+	diagnose)
+		(($# == 1)) || { usage >&2; exit 2; }
+		human_snapshot
+		show_top_processes
+		;;
+	sources)
+		(($# == 1)) || { usage >&2; exit 2; }
+		show_sources
+		;;
+	-h|--help|help)
+		usage
+		;;
+	*)
+		usage >&2
+		exit 2
+		;;
+esac

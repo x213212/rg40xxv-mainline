@@ -27,6 +27,9 @@ static size_t texture_count;
 static unsigned int flush_count;
 static unsigned int destroy_count;
 static unsigned int lifetime_violations;
+static unsigned int surface_alloc_count;
+static unsigned int surface_free_count;
+static unsigned int texture_free_count;
 
 #define CHECK(condition) do { \
 	if (!(condition)) { \
@@ -46,6 +49,7 @@ SDL_Surface *TTF_RenderUTF8_Blended(TTF_Font *font, const char *text,
 	if (surface != NULL) {
 		surface->w = (int)strlen(text) + 1;
 		surface->h = 12;
+		++surface_alloc_count;
 	}
 	return surface;
 }
@@ -69,6 +73,8 @@ SDL_Texture *SDL_CreateTextureFromSurface(SDL_Renderer *renderer,
 
 void SDL_FreeSurface(SDL_Surface *surface)
 {
+	if (surface != NULL)
+		++surface_free_count;
 	free(surface);
 }
 
@@ -189,9 +195,15 @@ int main(void)
 	CHECK(destroy_count == texture_count);
 	CHECK(lifetime_violations == 0);
 
-	for (size_t i = 0; i < texture_count; ++i)
+	CHECK(surface_free_count == surface_alloc_count);
+	for (size_t i = 0; i < texture_count; ++i) {
 		free(textures[i]);
-	printf("TEXT_TEXTURE_LIFETIME_TEST PASS textures=%zu flushes=%u destroys=%u\n",
-	       texture_count, flush_count, destroy_count);
+		textures[i] = NULL;
+		++texture_free_count;
+	}
+	CHECK(texture_free_count == texture_count);
+	printf("TEXT_TEXTURE_LIFETIME_TEST PASS textures=%zu texture_frees=%u surfaces=%u surface_frees=%u flushes=%u destroys=%u\n",
+	       texture_count, texture_free_count, surface_alloc_count,
+	       surface_free_count, flush_count, destroy_count);
 	return 0;
 }

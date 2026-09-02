@@ -1,21 +1,23 @@
 # RG40XX V 裝置控制服務（候選套件）
 
-這個目錄提供九套彼此獨立的裝置服務。它們目前只會產生候選套件，**不會安裝、啟用、連線或寫入實機**。
+這個目錄提供十套彼此獨立的裝置服務。它們目前只會產生候選套件，**不會安裝、啟用、連線或寫入實機**。
 
 ## 內容
 
 ### 1. USB 偵錯：`rg40xxv-usb-debug`
 
-- 透過 Linux configfs 建立複合 USB gadget：
-  - RNDIS 網路介面 `usb0`
-  - CDC ACM 序列埠 `/dev/ttyGS0`
+- 透過 Linux configfs 建立 USB gadget：
+  - 必要的 RNDIS 網路介面 `usb0`
+  - 若 H700 MUSB endpoint 配額可用，再同時提供 CDC ACM 序列埠 `/dev/ttyGS0`
+- 先嘗試 RNDIS + ACM；若 UDC 拒絕複合綁定，會解除 ACM config link 並改試 RNDIS-only。兩種都失敗才回報失敗，且成功前必須在同一 sysfs root 看到可驗證的 `/sys/class/net/usb0`。
+- 本候選不建立 ECM function；核心即使編入 `USB_CONFIGFS_ECM` 也不代表此服務已啟用 ECM。
 - 絕不建立 `mass_storage` function，也不會把 TF1、TF2、ROM 或存檔磁碟暴露給 USB host。
 - `rg40xxv-usb-debug.service` 是可重複執行的 systemd oneshot；停止服務只解除 UDC 綁定。
-- `rg40xxv-usb-debug-getty.service` 在 `ttyGS0` 啟動一般密碼登入提示，不會設定密碼或開啟自動登入。
+- `rg40xxv-usb-debug-getty.service` 只在 RNDIS + ACM 模式且 `ttyGS0` 存在時啟動一般密碼登入提示，不會設定密碼或開啟自動登入。
 - `99-rg40xxv-usb-debug.network` 可讓 systemd-networkd 將掌機設為 `10.55.0.1/24` 並向 USB host 發 DHCP 租約。
 - `check-kernel-config.sh` 會檢查 configfs、libcomposite、ACM、RNDIS 與 gadget serial 所需核心選項；UDC 控制器只能在目標 DTS／核心確認，因此另列為警告。
 
-預設 VID/PID 採 Linux Foundation 的開發用值，只適合內部測試；公開散布正式映像前必須申請或改用合法 VID/PID。此服務不會修改 SSH 設定；若系統原本已啟用 SSH，USB host 可經 `usb0` 連線。
+預設 VID/PID 採 Linux Foundation 的開發用值，只適合內部測試；公開散布正式映像前必須申請或改用合法 VID/PID。此服務不會安裝或修改 SSH daemon；因此「核心選項已編入」、「UDC 綁定並建立 `usb0`」、「Windows 辨識 RNDIS/ACM」、「`10.55.0.1` 上可登入 SSH」是四個不同 gate。fixture 只覆蓋前兩者的程式邏輯，不是 Windows 枚舉或 SSH 實機證據。
 
 ### 2. 日誌控制：`debug-logctl`
 
@@ -69,7 +71,7 @@ power-lockctl hardware brightness 0..100
 power-lockctl hardware joystick-rgb 0..100
 ```
 
-- 短按：保存背光與搖桿 RGB，立即關閉兩者；UI 進入 `paused`，停止動畫與繪圖；GPU runtime PM 改為 `auto`。不寫 CPU 頻率，也不做 full `sync`。
+- 短按：保存背光、搖桿 RGB 與每個 cpufreq policy 的 governor，立即關閉燈光；UI 進入 `paused`，停止動畫與繪圖；GPU runtime PM 改為 `auto`，CPU governor 暫時切為核心公開的 `powersave`。不寫 min/max frequency、不直接寫 PMIC 電壓，也不做 full `sync`。
 - `lock-enabled=true`（預設）：關屏狀態是 `screen_off` 且已鎖定；再短按還原背光／RGB並顯示鎖定畫面，不直接解鎖。
 - `lock-enabled=false`：關屏狀態明確叫 `light_sleep`；再短按只還原硬體並直接回到 `awake`，不顯示鎖定頁、不要求三連按。省電與鎖定在 API/state 中不混用。
 - 解鎖：在鎖定畫面用同一顆一般按鍵連按三次；換鍵或超過 1.5 秒會重算。RESET、音量上／下完全不計，也不破壞既有次數。
@@ -95,13 +97,14 @@ ui-hardwarectl volume-down
 ui-hardwarectl mute-toggle
 ui-hardwarectl usb-debug on
 ui-hardwarectl usb-debug off
-ui-hardwarectl network-status
 ui-hardwarectl network-wifi-recover
+ui-hardwarectl network-status
 ui-hardwarectl network-wifi-scan
-ui-hardwarectl network-wifi-connect BSSID   # 密碼由 stdin
+ui-hardwarectl network-wifi-connect BSSID  # 密碼只從 stdin
 ui-hardwarectl network-wifi-disconnect
 ui-hardwarectl network-wifi-forget UUID
 ui-hardwarectl network-hotspot on|off
+ui-hardwarectl reboot-custom
 ui-hardwarectl orderly-shutdown
 ```
 
@@ -109,8 +112,10 @@ ui-hardwarectl orderly-shutdown
 - `screen-off`、`screen-on`、背光與 RGB 都固定委派到 `power-lockctl hardware ...`，因此與 power-key state machine 共用 `/run/rg40xxv/power-lock/.lock`、硬體快照及 rollback，不會另外建立一套會互相覆寫的狀態。
 - 背光與 RGB 百分比會依各節點的 `max_brightness` 做整數換算。背光 `0` 會 clamp 到可信、非 symlink 的 `min_brightness`；沒有該節點時安全 fallback 為 raw `1`，不冒充關屏。只有 `screen-off` 會把背光真正寫成 `0`。production DT 的 joystick RGB 對應精確 sysfs 名稱 `rgb:kbd_backlight`；allowlist 也保留既有 joystick/stick 名稱，但排除 status/power LED。`joystick-rgb 0` 仍會真正關燈；目前只控制 scalar `brightness`，不宣稱能設定 RGB 色彩。
 - sysfs 列舉有固定上限，候選 class 名稱有 allowlist。Linux 正常建立的 `/sys/class/backlight/*`、`/sys/class/leds/*` 與 `/sys/class/udc/*` class-entry symlink 是唯一例外：必須經 `realpath -e` 落在同一 `/sys/devices/` 內；backlight/LED 的後續 attribute 仍必須是該 resolved device directory 內的 regular、non-symlink 檔案。任何 escape 都 fail closed。任一必要節點、快照或寫入失敗即還原；screen-off 失敗會嘗試還原背光、`bl_power`、RGB 與 GPU runtime PM。
-- `screen-off` 的 CPU 行為只有讓 UI 停止 render，再關背光／RGB並把 GPU runtime PM 設為 `auto`；CPU 交給 `schedutil` 與 CPU idle 自然降頻，這個入口不寫 CPU frequency、OPP、regulator 或 voltage。
-- `usb-debug on|off` 只以乾淨環境固定呼叫 `/usr/libexec/rg40xxv/usb-debugctl start|stop`。這是當次 bind/unbind，不會偷偷 enable unit；仍只有 RNDIS 與 ACM，絕不加入 mass-storage。
+- `screen-off` 會讓 UI 停止 render，關閉背光／RGB、把 GPU runtime PM 設為 `auto`，並透過唯一的 `cpu-policyctl` owner 保存 topology＋governor 後切到 `powersave`。`screen-on` 與 `recover-awake` 精確還原；部分寫入或輸出關閉失敗會補償回滾。CPU 還原失敗不會把使用者困在黑屏，快照會留在 `/run` 供下一次 recovery 重試。
+- `usb-debug on|off` 只以乾淨環境固定呼叫 `/usr/libexec/rg40xxv/usb-debugctl start|stop`。這是當次 bind/unbind，不會偷偷 enable unit；模式是 RNDIS + optional ACM，絕不加入 mass-storage。
+- 網路命令只以固定 argv 呼叫 `/usr/sbin/rg40xxv-network-control`。Wi-Fi 密碼只走 stdin pipe，不進 argv、journal 或 snapshot。
+- `reboot-custom` 的 argv 固定為 `/usr/sbin/rg40xxv-reboot-target custom`；UI 一般重啟不能傳入 `stock`、`fastboot` 或 `poweroff`。
 - `orderly-shutdown` 在 production 只會執行固定的 `/usr/bin/systemctl poweroff`。fixture mode 則要求固定 `/tmp/rg40xxv-device-control-test.*/mock-bin/systemctl`；測試不可能呼叫 host 的 systemctl。
 - 這個 shell helper 不是 setuid 權限邊界。正式 UI 必須由受信任的 root service 以固定 argv 呼叫，且不可繼承測試環境變數。
 
@@ -131,14 +136,16 @@ cpu-policyctl validate
 cpu-policyctl status
 cpu-policyctl ui-default
 cpu-policyctl lock-idle
+cpu-policyctl unlock-idle
 cpu-policyctl run-performance -- <模擬器與參數...>
 ```
 
 - `ui-default` 只把現有 cpufreq policy 切到核心已列出的 `schedutil`。
 - `run-performance` 先快照每個 policy 的 governor，再暫時切到 `performance` 執行遊戲；子程式正常、失敗或收到 TERM/INT 時都會還原。它不更改遊戲的存檔路徑或參數。
-- `lock-idle` 是明確的無寫入 hook：鎖屏依靠 CPU idle/runtime PM，不固定頻率。
+- policy lock 最多等 1 秒；競爭時回傳 75 且不改 governor，避免上一個異常 launcher 把 UI 或下一次啟動無限卡住。
+- `lock-idle` 原子保存 policy 名稱、`related_cpus` 與 governor，再切換所有 policy 到 `powersave`；`unlock-idle` 精確還原。重複 enter 不覆蓋第一份快照，topology 改變或部分寫入失敗會 fail closed／回滾。
 - `validate/status` 驗證 `scaling_available_governors`、`scaling_available_frequencies`（公開 OPP）及 eFuse nvmem 是否可見，但不讀出 eFuse 內容。
-- 程式中沒有寫入 `scaling_min_freq`、`scaling_max_freq`、`scaling_setspeed`、CPU `online`、regulator 或 voltage 的路徑，因此不會超頻、不會離線核心，也不會猜測未公開 OPP。
+- 程式仍不寫 `scaling_min_freq`、`scaling_max_freq`、`scaling_setspeed`、CPU `online`、regulator 或 voltage；省電只選用核心已公開的 `powersave` governor，因此不會超頻、不會離線核心，也不會猜測未公開 OPP。實際 OPP 電壓由 cpufreq/PMIC driver 決定。
 - production 核心目前最低公開 CPU OPP 是 **480 MHz**。UI 只顯示 sysfs 實際公開清單；本套件不寫入、不顯示也不宣稱 240 MHz 可用。
 
 ### 8. OpenVPN client backend：`vpn-profilectl` / `vpn-firewall`
@@ -161,25 +168,31 @@ vpn-firewall apply NAME
 - traffic policy 固定為 `moonlight` 與 `games` 兩個 key，值只接受 `bypass|vpn`。預設 Moonlight bypass（目前 Sunshine 在 LAN）、games 使用 VPN；launcher 讀 `policy get` 決定 route/bind。這是明確設定契約，不宣稱尚未整合的遠端 policy-routing 已完成。
 - 目前只允許同時一個 active VPN profile，避免兩個 profile 爭用同一 nftables table。
 
-### 9. NetworkManager／Wi-Fi 控制：`rg40xxv-network-control`
+### 9. NetworkManager Wi-Fi／個人熱點：`rg40xxv-network-control`
+
+- `prepare/recover/status/scan/connect/disconnect/forget/hotspot` 全部是具型別的固定命令；不接受任意介面、連線名稱或 shell 字串。
+- `scan` 使用 NetworkManager 的真實 rescan；失敗不會被包裝成成功的空清單。最多發布 32 個基地台，snapshot 以 temporary file + rename 原子更新。
+- 連線以 BSSID 選取基地台；WPA-PSK 密碼只從單行 stdin 取得，known profile 走 UUID，忘記網路只接受 canonical UUID。
+- 熱點固定使用 `rg40xxv-hotspot`／`RG40XXV-Hotspot`，不允許 UI 注入 SSID 或 profile 名稱。
+- UI 啟動不等待網路：準備服務由 multi-user target 平行拉起；UI 內 status/scan/connect 都走既有背景 worker、單一 in-flight refresh 與有界 timeout，渲染執行緒不執行 nmcli。
+- saved Wi-Fi profile 設定 `connection.autoconnect=yes` 並關閉 Wi-Fi powersave，避免閒置 UI 後 SSH／串流斷線。
+
+### 10. 唯讀電源監控：`rg40xxv-power-monitor`
 
 ```text
-rg40xxv-network-control prepare
-rg40xxv-network-control recover
-rg40xxv-network-control status
-rg40xxv-network-control scan
-rg40xxv-network-control connect BSSID   # WPA-PSK 只由 stdin 傳入
-rg40xxv-network-control disconnect
-rg40xxv-network-control forget UUID
-rg40xxv-network-control hotspot on|off
+rg40xxv-power-monitor once
+rg40xxv-power-monitor watch 5 0
+rg40xxv-power-monitor csv 5 120
+rg40xxv-power-monitor trend 5 60
+rg40xxv-power-monitor diagnose
+rg40xxv-power-monitor sources
 ```
 
-- `default-wifi-powersave-on.conf` 在 release 最上層把 NetworkManager 的 `wifi.powersave` 固定為 `2`（停用 Wi-Fi 省電）；`prepare` 也只對已驗證為 Wi-Fi、非 AP mode 的 UUID 套用 powersave 2、autoconnect 與不限重試，不碰 VPN／乙太網路 profile。
-- `rg40xxv-network-prepare.service` 在 dbus／NetworkManager 後執行，固定解除 NetworkManager mask、enable/start、解除 Wi-Fi rfkill，再發布 `/run/rg40xxv/network/snapshot.v1`。multi-user 會啟動它；time-sync 明確排在它之後。UI 只 `Wants=`、不加 `After=`，因此網路準備不會阻塞首幀。
-- snapshot 是 root-owned `0600`、原子 rename 的有界格式，最多 32 個 AP；SSID/security 以 percent encoding 傳輸。UI 只接受 canonical BSSID／UUID，提供掃描、AP 選擇、WPA 密碼鍵盤、連線、中斷、忘記及 hotspot 切換／狀態。
-- 密碼不放在 UI helper 或 nmcli argv。UI worker 以匿名 pipe 傳給 `ui-hardwarectl`，後者原樣交給 network helper；新 WPA-PSK 連線再用 `nmcli --ask` 從 stdin 讀取。測試同時檢查 capture 與 log 都沒有密碼。
-- `connect` 目前支援開放網路與 WPA-PSK；WEP 與 enterprise/EAP 明確拒絕，不冒充成功。hotspot 使用固定 connection name／SSID，由 NetworkManager 產生並保存其 PSK；UI 本版只做切換與狀態，不把 PSK 寫入日誌。
-- helper 不是通用 nmcli wrapper，不接受自訂 interface、connection name、命令或 shell 字串；介面固定為 `wlan0`，hotspot 固定為 `rg40xxv-hotspot`。
+- `once` 分開顯示電池 VBAT、AXP717 raw current、USB VBUS/input limit、CPU 核心電壓與 governor、GPU runtime、背光及 Wi-Fi；CPU 核心電壓不是電池電壓。
+- `watch` 提供即時資料；`csv` 固定輸出原始整數與 monotonic 時間；`trend` 預設取 5 分鐘資料並以 VBAT 線性回歸估算 mV/min。USB online 或充放電狀態改變時會切新 epoch，不混算兩種狀態。
+- AXP717 驅動的 `current_now` 有未知 offset 且方向不可靠，只標示 `raw_current`，不計算瓦數或續航；`input_current_limit` 也只是上限，不是實際 USB 電流。
+- 工具刻意不讀 `health` 或整份 `uevent`，因目前 AXP717 health getter 會清除 PMIC fault bits。所有 sysfs/procfs 操作均為唯讀，不寫 governor、PMIC、p7 或 p8。
+- 精確來源可用 `sources` 查看。若要判斷掉電，請拔掉 USB 後保持負載與亮度不變，至少執行 `trend 5 60`；短時間 VBAT 抖動及 capacity 階梯不能直接外推續航。
 
 ## 建置與驗證
 
@@ -206,4 +219,3 @@ cd services/device-control
 8. CPU policy 先以 `validate` 確認 `schedutil`、`performance` 與最低 480 MHz OPP；遊戲 launcher 必須使用 `run-performance -- ...`，不可自行寫 governor 而漏掉退出還原。
 9. VPN 正式整合要安裝 OpenVPN/nftables，確認 endpoint 與 `.ovpn` remote 一致，再以 LAN SSH 連線做 kill-switch 中斷／重連測試；切勿先開 kill switch 再補 endpoint。
 10. 音量服務上機前確認 card 0 ID、七個 control 的 type/range 與 `gpio-keys-volume` name/capability，再跑喇叭及耳機各 20 輪 0/5/55/100、mute、長按 autorepeat；fixture 數據不是實機音壓或 latency 驗證。
-11. 網路 hotfix 上機後確認 `NetworkManager` 未被 charge-mode launcher 再次 mask、`iw dev wlan0 get power_save` 為 off，並做 idle 10 分鐘、AP scan/connect/disconnect/forget/hotspot、SSH 及 mDNS multicast 20 輪；host fixture 不能證明 rtw88 真機 RF/firmware 穩定性。

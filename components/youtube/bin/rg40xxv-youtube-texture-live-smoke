@@ -1,0 +1,88 @@
+#!/bin/sh
+set -eu
+umask 077
+
+self=$(readlink -f -- "$0") || {
+	printf '%s\n' 'YOUTUBE_TEXTURE_LAUNCH result=FAIL reason=self-path' >&2
+	exit 66
+}
+self_root=$(CDPATH= cd -- "$(dirname -- "$self")/.." && pwd -P)
+root=${RG_YOUTUBE_TEXTURE_ROOT:-$self_root}
+state_home=${RG_YOUTUBE_STATE_HOME:-/mnt/data/rg40xxv/state/home}
+cache_root=$state_home/.cache/rg40xxv-youtube
+runtime_root=${RG_YOUTUBE_RUNTIME_ROOT:-/run/rg40xxv-youtube}
+yt_dlp_socket=${RG_YOUTUBE_YTDLP_SOCKET:-$runtime_root/yt-dlp.sock}
+yt_dlp_cache=${RG_YOUTUBE_YTDLP_CACHE:-$cache_root/yt-dlp}
+resolver_ensure=${RG_YOUTUBE_RESOLVER_ENSURE:-$root/bin/rg40xxv-youtube-resolver-ensure}
+
+export HOME=$state_home
+export XDG_CACHE_HOME=$HOME/.cache
+export XDG_CONFIG_HOME=$HOME/.config
+export XDG_RUNTIME_DIR=$runtime_root/xdg
+export SDL_VIDEODRIVER=kmsdrm
+export SDL_KMSDRM_DEVICE_INDEX=1
+export SDL_KMSDRM_REQUIRE_DRM_MASTER=1
+export SDL_AUDIODRIVER=alsa
+export SDL_AUDIO_FREQUENCY=48000
+export SDL_GAMECONTROLLERCONFIG_FILE=/opt/rg40xxv/share/gamecontrollerdb.txt
+export LIBGL_DRIVERS_PATH=/opt/rg40xxv/mesa/lib/dri
+export MESA_SHADER_CACHE_DIR=${RG_YOUTUBE_SHADER_CACHE_DIR:-/mnt/data/rg40xxv/state/shader-cache/mesa-23.3.6-panfrost-v1}
+export MESA_SHADER_CACHE_MAX_SIZE=64M
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+export LD_LIBRARY_PATH=/opt/rg40xxv/sdl/lib:/opt/rg40xxv/mesa/lib:/opt/glibc-2.38/lib:/opt/glibc-2.38/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/usr/lib
+export LD_PRELOAD=/opt/rg40xxv/sdl/lib/libSDL2-2.0.so.0.2800.5:/opt/rg40xxv/mesa/lib/libEGL.so.1:/opt/rg40xxv/mesa/lib/libGLESv2.so.2
+export RG_YOUTUBE_SCREENSHOT_PATH=$runtime_root/texture.bmp
+export RG_YOUTUBE_CACHE_TOOL=$root/tools/resolver_cache.py
+export RG_YOUTUBE_BRIDGE=$root/tools/bounded_range_bridge.py
+export RG_YOUTUBE_RESOLVER=$root/tools/resolve_youtube.py
+export RG_YOUTUBE_BROKER=$root/tools/endpoint_broker.py
+export RG_YOUTUBE_FEED_HELPER=$root/tools/youtube_feed.py
+export RG_YOUTUBE_YTDLP=$root/vendor/yt-dlp
+export RG_YOUTUBE_FEED_CACHE=$cache_root/feed
+export RG_YOUTUBE_CACHE_DIR=$cache_root/resolver
+export RG_YOUTUBE_RUNTIME_ROOT=$runtime_root
+export RG_YOUTUBE_YTDLP_SOCKET=$yt_dlp_socket
+export RG_YOUTUBE_YTDLP_CACHE=$yt_dlp_cache
+export YT_DLP_BIN=$root/vendor/yt-dlp
+
+for private_directory in "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
+	"$cache_root" "$RG_YOUTUBE_FEED_CACHE" "$RG_YOUTUBE_CACHE_DIR" \
+	"$RG_YOUTUBE_YTDLP_CACHE" "$runtime_root" "$XDG_RUNTIME_DIR" \
+	"$MESA_SHADER_CACHE_DIR"; do
+	if [ -L "$private_directory" ]; then
+		printf 'YOUTUBE_TEXTURE_LAUNCH result=FAIL reason=private-directory-symlink path=%s\n' \
+			"$private_directory" >&2
+		exit 66
+	fi
+done
+mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
+	"$cache_root" "$RG_YOUTUBE_FEED_CACHE" "$RG_YOUTUBE_CACHE_DIR" \
+	"$RG_YOUTUBE_YTDLP_CACHE" "$XDG_RUNTIME_DIR" "$MESA_SHADER_CACHE_DIR"
+for private_directory in "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
+	"$cache_root" "$RG_YOUTUBE_FEED_CACHE" "$RG_YOUTUBE_CACHE_DIR" \
+	"$RG_YOUTUBE_YTDLP_CACHE" "$runtime_root" "$XDG_RUNTIME_DIR" \
+	"$MESA_SHADER_CACHE_DIR"; do
+	if [ ! -d "$private_directory" ] || [ -L "$private_directory" ] || \
+	   [ "$(stat -c %u "$private_directory")" -ne "$(id -u)" ]; then
+		printf 'YOUTUBE_TEXTURE_LAUNCH result=FAIL reason=private-directory-owner path=%s\n' \
+			"$private_directory" >&2
+		exit 66
+	fi
+	chmod 0700 "$private_directory"
+done
+
+if [ ! -x "$resolver_ensure" ] || [ ! -f "$resolver_ensure" ] || \
+   [ -L "$resolver_ensure" ]; then
+	printf 'YOUTUBE_TEXTURE_LAUNCH result=FAIL reason=resolver-ensure path=%s\n' \
+		"$resolver_ensure" >&2
+	exit 66
+fi
+# The resolver is a system-manager-owned singleton.  It survives scene exit,
+# MENU+START and UI relaunch; this wrapper never owns or cleans up its socket.
+"$resolver_ensure"
+
+if [ "$#" -eq 0 ]; then
+	set -- --home
+fi
+
+exec "$root/bin/rg40xxv-youtube-sdl-texture-scene" "$@"

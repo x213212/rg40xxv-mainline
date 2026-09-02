@@ -66,8 +66,11 @@ for led in status:green power:red status:joystick power:stick; do
 done
 printf 'on' >"$ROOTFS/sys/class/drm/card0/device/power/control"
 printf 'schedutil' >"$ROOTFS/sys/devices/system/cpu/cpufreq/policy0/scaling_governor"
+printf 'performance powersave schedutil' \
+    >"$ROOTFS/sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors"
 printf '480000 1008000 1512000' \
     >"$ROOTFS/sys/devices/system/cpu/cpufreq/policy0/scaling_available_frequencies"
+printf '0 1 2 3' >"$ROOTFS/sys/devices/system/cpu/cpufreq/policy0/related_cpus"
 
 MOCK_SYSTEMCTL="$FIXTURE/mock-bin/systemctl"
 {
@@ -192,6 +195,7 @@ mv -- "$MOCK_REBOOT_TARGET.unavailable" "$MOCK_REBOOT_TARGET"
 [[ $(<"$ROOTFS/sys/class/leds/status:green/brightness") == 99 ]]
 [[ $(<"$ROOTFS/sys/class/leds/power:red/brightness") == 99 ]]
 [[ $(<"$ROOTFS/sys/class/drm/card0/device/power/control") == auto ]]
+[[ $(<"$ROOTFS/sys/devices/system/cpu/cpufreq/policy0/scaling_governor") == powersave ]]
 grep -q '^mode=screen_off$' "$ROOTFS/run/rg40xxv/power-lock/state.v1"
 grep -q '^ui_mode=paused$' "$ROOTFS/run/rg40xxv/power-lock/state.v1"
 
@@ -202,8 +206,24 @@ grep -q '^ui_mode=paused$' "$ROOTFS/run/rg40xxv/power-lock/state.v1"
 [[ $(<"$ROOTFS/sys/class/leds/joystick-right/brightness") == 102 ]]
 [[ $(<"$ROOTFS/sys/class/leds/rgb:kbd_backlight/brightness") == 102 ]]
 [[ $(<"$ROOTFS/sys/class/drm/card0/device/power/control") == on ]]
+[[ $(<"$ROOTFS/sys/devices/system/cpu/cpufreq/policy0/scaling_governor") == schedutil ]]
 grep -q '^mode=lock_screen$' "$ROOTFS/run/rg40xxv/power-lock/state.v1"
 grep -q '^ui_mode=active$' "$ROOTFS/run/rg40xxv/power-lock/state.v1"
+
+# UI 被 supervisor 重啟時，recover-awake 必須復原關屏 snapshot；正常
+# awake 狀態重跑則必須是無副作用的 idempotent no-op。
+"$CTL" screen-off >/dev/null
+"$CTL" recover-awake >/dev/null
+[[ $(<"$ROOTFS/sys/class/backlight/lcd-backlight/brightness") == 50 ]]
+[[ $(<"$ROOTFS/sys/class/backlight/lcd-backlight/bl_power") == 0 ]]
+[[ $(<"$ROOTFS/sys/class/drm/card0/device/power/control") == on ]]
+[[ $(<"$ROOTFS/sys/devices/system/cpu/cpufreq/policy0/scaling_governor") == schedutil ]]
+grep -q '^mode=awake$' "$ROOTFS/run/rg40xxv/power-lock/state.v1"
+"$CTL" recover-awake >/dev/null
+grep -q '^mode=awake$' "$ROOTFS/run/rg40xxv/power-lock/state.v1"
+"$CTL" screen-off >/dev/null
+"$CTL" screen-on >/dev/null
+grep -q '^mode=lock_screen$' "$ROOTFS/run/rg40xxv/power-lock/state.v1"
 
 # screen-off 的最後一步失敗時，GPU、RGB 與 bl_power 都必須回復。
 if POWER_LOCK_TEST_FAIL_STEP=backlight_brightness "$CTL" screen-off >/dev/null 2>&1; then
@@ -216,6 +236,7 @@ fi
 [[ $(<"$ROOTFS/sys/class/leds/joystick-right/brightness") == 102 ]]
 [[ $(<"$ROOTFS/sys/class/leds/rgb:kbd_backlight/brightness") == 102 ]]
 [[ $(<"$ROOTFS/sys/class/drm/card0/device/power/control") == on ]]
+[[ $(<"$ROOTFS/sys/devices/system/cpu/cpufreq/policy0/scaling_governor") == schedutil ]]
 grep -q '^mode=lock_screen$' "$ROOTFS/run/rg40xxv/power-lock/state.v1"
 
 # 第二顆 RGB 寫入失敗，第一顆已改值也必須 rollback。
@@ -379,4 +400,4 @@ CPU_AFTER=$(sha256sum "$ROOTFS/sys/devices/system/cpu/cpufreq/policy0/"*)
 [[ $(<"$ROOTFS/sys/devices/system/cpu/cpufreq/policy0/scaling_available_frequencies") == \
     '480000 1008000 1512000' ]]
 
-printf 'PASS ui-hardwarectl：command-scoped helper、allowlist、安全背光 minimum、RGB 0、volume/network 固定 argv、密碼不進 argv、reboot 固定 custom、screen rollback、no-symlink/bounds、USB 無 mass-storage、mock poweroff、CPU 零寫入\n'
+printf 'PASS ui-hardwarectl：command-scoped helper、allowlist、安全背光 minimum、RGB 0、volume/network 固定 argv、密碼不進 argv、reboot 固定 custom、screen+CPU rollback、no-symlink/bounds、USB 無 mass-storage、mock poweroff\n'

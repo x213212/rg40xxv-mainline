@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const SDL_Color primary = { 238, 238, 238, 255 };
@@ -51,25 +52,65 @@ static void draw_transition_title(struct ui *ui, const char *value, int y)
 	draw_transition_text(ui, 2, fitted, y, focus);
 }
 
-static void draw_transition_wave(struct ui *ui, int y, uint32_t now)
+struct transition_glyph {
+	char text[5];
+	int width;
+};
+
+static size_t transition_glyph_size(const char *text)
 {
-	SDL_Point points[49];
-	const int left = 128;
-	const int step = 8;
-	const double phase = (double)now / 115.0;
+	unsigned char lead = (unsigned char)text[0];
 
-	for (size_t i = 0; i < sizeof(points) / sizeof(points[0]); ++i) {
-		double envelope = sin((double)i * 3.141592653589793 / 48.0);
+	if (lead < 0x80U)
+		return 1U;
+	if ((lead & 0xe0U) == 0xc0U)
+		return 2U;
+	if ((lead & 0xf0U) == 0xe0U)
+		return 3U;
+	if ((lead & 0xf8U) == 0xf0U)
+		return 4U;
+	return 1U;
+}
 
-		points[i].x = left + (int)i * step;
-		points[i].y = y + (int)lrint(sin(phase + (double)i * 0.48) *
-					      7.0 * envelope);
+static void draw_transition_wave_text(struct ui *ui, const char *value,
+				      int y, uint32_t now)
+{
+	static const int8_t wave[] = { 0, -1, -3, -4, -3, -1, 0, 1 };
+	struct transition_glyph glyphs[64];
+	const SDL_Color color = { 157, 157, 157, 255 };
+	size_t count = 0U;
+	int width = 0;
+	int x;
+
+	while (*value != '\0' && count < sizeof(glyphs) / sizeof(glyphs[0])) {
+		size_t remaining = strlen(value);
+		size_t length = transition_glyph_size(value);
+
+		if (length > remaining)
+			length = 1U;
+		memcpy(glyphs[count].text, value, length);
+		glyphs[count].text[length] = '\0';
+		glyphs[count].width = text_width(ui, 0, glyphs[count].text, color);
+		width += glyphs[count].width;
+		value += length;
+		++count;
 	}
-	render_set_color(ui->renderer, (SDL_Color){ 220, 220, 220, 218 });
-	(void)SDL_RenderDrawLines(ui->renderer, points,
-				  (int)(sizeof(points) / sizeof(points[0])));
-	render_fill_rect(ui->renderer, left, y + 15, 384, 1,
-			 (SDL_Color){ 220, 220, 220, 32 });
+	x = UI_WIDTH / 2 - width / 2;
+	for (size_t i = 0U; i < count; ++i) {
+		size_t phase = ((size_t)(now / 70U) + i) %
+			(sizeof(wave) / sizeof(wave[0]));
+
+		text_draw(ui, 0, glyphs[i].text, x, y + wave[phase], color);
+		x += glyphs[i].width;
+	}
+	for (int i = 0; i < 3; ++i) {
+		int phase = ((int)(now / 140U) + i) % 3;
+		uint8_t alpha = phase == 0 ? 230U : phase == 1 ? 138U : 70U;
+
+		render_fill_round_rect(ui->renderer, UI_WIDTH / 2 - 17 + i * 13,
+			y + 34, 7, 7, 3,
+			(SDL_Color){ 220, 220, 220, alpha });
+	}
 }
 
 static void draw_launch_error(struct ui *ui)
@@ -133,9 +174,8 @@ static void draw_launch_transition(struct ui *ui, uint32_t now, bool full)
 		(SDL_Color){ 180, 180, 180, 76 });
 	material_icon_draw(ui, MATERIAL_ICON_PLAY, 302, panel_y + 19, 36,
 		(SDL_Color){ 220, 220, 220, 255 }, true, true);
-	draw_transition_text(ui, 0, title, panel_y + 61, secondary);
+	draw_transition_wave_text(ui, title, panel_y + 61, now);
 	draw_transition_title(ui, ui->launch.game_title, panel_y + 91);
-	draw_transition_wave(ui, panel_y + 151, now);
 }
 
 static void draw_chip(struct ui *ui, int x, int y, int w, int h, bool active)
@@ -192,6 +232,9 @@ static void draw_empty_state(struct ui *ui)
 	if (ui->catalog.apps_only) {
 		title = tr(ui, "no_apps");
 		hint = tr(ui, "check_apps_root");
+	} else if (ui->catalog.rpg_only) {
+		title = tr(ui, "no_rpg");
+		hint = tr(ui, "check_rpg_root");
 	} else {
 		title = ui->catalog.game_count == 0 ?
 			tr(ui, "no_rom") : tr(ui, "no_match");
@@ -214,6 +257,7 @@ static void draw_library(struct ui *ui, uint32_t now)
 	const char *page_title = ui->nav_index == NAV_PAGE_RECENT ?
 		tr(ui, "nav_recent") :
 		ui->nav_index == NAV_PAGE_FAVORITES ? tr(ui, "nav_favorites") :
+		catalog->rpg_only ? tr(ui, "rpg_title") :
 		catalog->apps_only ? tr(ui, "apps_title") : tr(ui, "library");
 	bool content_focused = ui->focus_region == UI_FOCUS_CONTENT;
 
@@ -268,8 +312,13 @@ static void draw_library(struct ui *ui, uint32_t now)
 	draw_clipped_text(ui, 1, selected->title,
 		UI_LAYOUT_LIBRARY_INFO_X + 10, UI_LAYOUT_LIBRARY_INFO_Y + 1,
 		UI_LAYOUT_LIBRARY_INFO_WIDTH - 20, primary);
-	draw_clipped_text(ui, 0, selected->system_label,
-		UI_LAYOUT_LIBRARY_INFO_X + 10, UI_LAYOUT_LIBRARY_INFO_Y + 20,
+	if (catalog_system_is_pending_rpg(selected->system) && !selected->playable)
+		(void)snprintf(text, sizeof(text), "%s · %s",
+			selected->system_label, tr(ui, "rpg_pending_entry"));
+	else
+		(void)snprintf(text, sizeof(text), "%s", selected->system_label);
+	draw_clipped_text(ui, 0, text, UI_LAYOUT_LIBRARY_INFO_X + 10,
+		UI_LAYOUT_LIBRARY_INFO_Y + 20,
 		UI_LAYOUT_LIBRARY_INFO_WIDTH - 20, secondary);
 }
 
@@ -314,6 +363,13 @@ static void draw_controls(struct ui *ui)
 {
 	render_fill_rect(ui->renderer, 20, 435, UI_WIDTH - 40, 1,
 			 (SDL_Color){ 160, 160, 160, 42 });
+	if (ui->network.password_active) {
+		draw_button_hint(ui, 14, "A", tr(ui, "enter"));
+		draw_button_hint(ui, 170, "B", tr(ui, "delete"));
+		draw_button_hint(ui, 326, "X", tr(ui, "shift"));
+		draw_button_hint(ui, 482, "Y", tr(ui, "layout"));
+		return;
+	}
 	if (!ui->search_active && ui->focus_region == UI_FOCUS_TOP_NAV) {
 		draw_button_hint(ui, 68, "<>", tr(ui, "switch_tab"));
 		draw_button_hint(ui, 278, "Av", tr(ui, "enter_content"));
@@ -321,10 +377,15 @@ static void draw_controls(struct ui *ui)
 		return;
 	}
 	if (!ui->search_active && ui->nav_index == NAV_PAGE_SETTINGS) {
-		draw_button_hint(ui, 14, "^v", tr(ui, "select"));
-		draw_button_hint(ui, 170, "<>", tr(ui, "adjust"));
-		draw_button_hint(ui, 326, "A", tr(ui, "change"));
-		draw_button_hint(ui, 482, "B", tr(ui, "top_nav"));
+		if (ui->settings_detail_active) {
+			draw_button_hint(ui, 14, "<>", tr(ui, "adjust"));
+			draw_button_hint(ui, 222, "A", tr(ui, "change"));
+			draw_button_hint(ui, 430, "B", tr(ui, "back"));
+		} else {
+			draw_button_hint(ui, 92, "^v", tr(ui, "select"));
+			draw_button_hint(ui, 292, "A", tr(ui, "enter"));
+			draw_button_hint(ui, 492, "B", tr(ui, "top_nav"));
+		}
 		return;
 	}
 	if (!ui->search_active && ui->nav_index == NAV_PAGE_STREAMING) {
@@ -340,16 +401,24 @@ static void draw_controls(struct ui *ui)
 		return;
 	}
 	if (!ui->search_active && ui->nav_index == NAV_PAGE_NETWORK) {
-		if (ui->bluetooth.open) {
+		if (ui->network.detail_active &&
+		    ui->network.selected == NETWORK_UI_WIFI) {
 			draw_button_hint(ui, 14, "^v", tr(ui, "select"));
-			draw_button_hint(ui, 170, "A", tr(ui, "bluetooth_action"));
-			draw_button_hint(ui, 326, "Y", tr(ui, "bluetooth_forget"));
-			draw_button_hint(ui, 482, "B", tr(ui, "back"));
-		} else {
-			draw_button_hint(ui, 92, "<>", tr(ui, "select"));
-			draw_button_hint(ui, 292, "A", tr(ui, "enter"));
-			draw_button_hint(ui, 492, "B", tr(ui, "top_nav"));
+			draw_button_hint(ui, 170, "A", tr(ui, "network_connect"));
+			draw_button_hint(ui, 326, "X", tr(ui, "network_scan"));
+			draw_button_hint(ui, 482, "Y", tr(ui, "network_manage"));
+			return;
 		}
+		if (ui->bluetooth.detail_active) {
+			draw_button_hint(ui, 14, "^v", tr(ui, "select"));
+			draw_button_hint(ui, 170, "A", tr(ui, "change"));
+			draw_button_hint(ui, 326, "X", tr(ui, "stream_reload"));
+			draw_button_hint(ui, 482, "B", tr(ui, "back"));
+			return;
+		}
+		draw_button_hint(ui, 92, "<>", tr(ui, "select"));
+		draw_button_hint(ui, 292, "A", tr(ui, "enter"));
+		draw_button_hint(ui, 492, "B", tr(ui, "top_nav"));
 		return;
 	}
 	draw_button_hint(ui, 14, "A", tr(ui, ui->search_active ? "enter" :
@@ -361,16 +430,27 @@ static void draw_controls(struct ui *ui)
 
 static void render_controls(struct ui *ui)
 {
+	static int verify_direct = -1;
 	SDL_Rect section = { 0, 435, UI_WIDTH, UI_HEIGHT - 435 };
-	int mode = ui->search_active ? 1 : ui->focus_region == UI_FOCUS_TOP_NAV ? 10 :
-		ui->nav_index == NAV_PAGE_SETTINGS ? 2 :
+	int mode = ui->network.password_active ? 11 : ui->search_active ? 1 :
+		ui->focus_region == UI_FOCUS_TOP_NAV ? 10 :
+		ui->nav_index == NAV_PAGE_SETTINGS ?
+			(ui->settings_detail_active ? 6 : 2) :
 		ui->nav_index == NAV_PAGE_STREAMING ? 3 :
 		ui->nav_index == NAV_PAGE_APPS ? 4 :
 		ui->nav_index == NAV_PAGE_NETWORK ?
-			(ui->bluetooth.open ? 6 : 5) : 0;
+			(ui->network.detail_active ? 8 :
+			 ui->bluetooth.detail_active ? 7 : 5) : 0;
 	bool current = ui->controls_cache != NULL &&
 		ui->controls_cache_mode == mode &&
 		ui->controls_cache_language == ui->locale.language;
+
+	if (verify_direct < 0)
+		verify_direct = getenv("RG40XXV_TEST_DIRECT_COMPOSITE") != NULL;
+	if (verify_direct) {
+		draw_controls(ui);
+		return;
+	}
 
 	if (!current && ui->metrics.input_counter != 0U) {
 		draw_controls(ui);
@@ -387,11 +467,15 @@ static void render_controls(struct ui *ui)
 			draw_controls(ui);
 			return;
 		}
-		render_set_color(ui->renderer, (SDL_Color){ 0, 0, 0, 0 });
+		render_set_color(ui->renderer, (SDL_Color){ 5, 5, 5, 255 });
 		(void)SDL_RenderClear(ui->renderer);
 		draw_controls(ui);
 		(void)SDL_SetRenderTarget(ui->renderer, NULL);
-		(void)SDL_SetTextureBlendMode(target, SDL_BLENDMODE_BLEND);
+		if (!render_set_opaque_cache_blend(target)) {
+			SDL_DestroyTexture(target);
+			draw_controls(ui);
+			return;
+		}
 		if (ui->controls_cache != NULL)
 			SDL_DestroyTexture(ui->controls_cache);
 		ui->controls_cache = target;
@@ -430,8 +514,60 @@ static void draw_action_osd(struct ui *ui, uint32_t now)
 	(void)SDL_RenderSetClipRect(ui->renderer, NULL);
 }
 
+void render_prepare_static(struct ui *ui, uint32_t now)
+{
+	SDL_Texture *previous;
+	SDL_Texture *warmup;
+	bool static_backdrop;
+
+	if (ui->renderer == NULL)
+		return;
+	previous = SDL_GetRenderTarget(ui->renderer);
+	warmup = SDL_CreateTexture(ui->renderer, SDL_PIXELFORMAT_ARGB8888,
+		SDL_TEXTUREACCESS_TARGET, UI_WIDTH, UI_HEIGHT);
+	if (warmup == NULL || SDL_SetRenderTarget(ui->renderer, warmup) != 0) {
+		if (warmup != NULL)
+			SDL_DestroyTexture(warmup);
+		(void)SDL_SetRenderTarget(ui->renderer, previous);
+		return;
+	}
+	render_set_color(ui->renderer, (SDL_Color){ 5, 5, 5, 255 });
+	(void)SDL_RenderClear(ui->renderer);
+	static_backdrop = ui->nav_index > NAV_PAGE_FAVORITES &&
+		ui->nav_index != NAV_PAGE_RPG && ui->nav_index != NAV_PAGE_APPS;
+	if (ui->nav_index == NAV_PAGE_SETTINGS) {
+		render_settings_background(ui, false);
+		render_settings_background(ui, true);
+		render_settings_page(ui, now);
+	} else if (static_backdrop) {
+		render_backdrop(ui);
+	}
+	render_status(ui);
+	(void)SDL_RenderFlush(ui->renderer);
+	(void)SDL_SetRenderTarget(ui->renderer, previous);
+	SDL_DestroyTexture(warmup);
+
+	/* These routines populate their own retained target textures.  Preparing
+	 * them before the first timed frame avoids synchronous font rasterization
+	 * on first presentation without presenting or omitting any scene. */
+	render_navigation(ui, now);
+	(void)SDL_SetRenderTarget(ui->renderer, previous);
+	render_controls(ui);
+	(void)SDL_SetRenderTarget(ui->renderer, previous);
+}
+
 void render_scene(struct ui *ui, uint32_t now)
 {
+	static int profile = -1;
+	uint64_t profile_ticks[9] = { 0 };
+	uint64_t profile_frequency = 0;
+
+	if (profile < 0)
+		profile = getenv("RG40XXV_RENDER_PROFILE") != NULL;
+	if (profile) {
+		profile_frequency = SDL_GetPerformanceFrequency();
+		profile_ticks[0] = SDL_GetPerformanceCounter();
+	}
 	if (ui->launch.transition == LAUNCH_TRANSITION_STARTING) {
 		draw_launch_transition(ui, now, true);
 		SDL_RenderPresent(ui->renderer);
@@ -441,10 +577,20 @@ void render_scene(struct ui *ui, uint32_t now)
 	}
 	render_set_color(ui->renderer, (SDL_Color){ 5, 5, 5, 255 });
 	(void)SDL_RenderClear(ui->renderer);
+	if (profile)
+		profile_ticks[1] = SDL_GetPerformanceCounter();
 	if (ui->nav_index <= NAV_PAGE_FAVORITES ||
+	    ui->nav_index == NAV_PAGE_RPG ||
 	    ui->nav_index == NAV_PAGE_APPS)
 		cover_cache_sync_visible(ui);
-	render_backdrop(ui);
+	if (ui->nav_index == NAV_PAGE_SETTINGS &&
+	    ui->power.view != POWER_VIEW_LOCKED &&
+	    ui->power.view != POWER_VIEW_SHUTDOWN_COUNTDOWN)
+		render_settings_page(ui, now);
+	else
+		render_backdrop(ui);
+	if (profile)
+		profile_ticks[2] = SDL_GetPerformanceCounter();
 	if (ui->power.view == POWER_VIEW_LOCKED ||
 	    ui->power.view == POWER_VIEW_SHUTDOWN_COUNTDOWN) {
 		render_status(ui);
@@ -454,15 +600,15 @@ void render_scene(struct ui *ui, uint32_t now)
 		return;
 	}
 	render_status(ui);
+	if (profile)
+		profile_ticks[3] = SDL_GetPerformanceCounter();
 	render_navigation(ui, now);
-	if (ui->nav_index == NAV_PAGE_SETTINGS)
-		render_system_info(ui, now);
-	else if (ui->nav_index == NAV_PAGE_NETWORK) {
-		if (ui->bluetooth.open)
-			render_bluetooth_page(ui, now);
-		else
-			render_network_page(ui, now);
-	}
+	if (profile)
+		profile_ticks[4] = SDL_GetPerformanceCounter();
+	if (ui->nav_index == NAV_PAGE_SETTINGS) {
+		/* The retained settings page was composed before status/navigation. */
+	} else if (ui->nav_index == NAV_PAGE_NETWORK)
+		render_network_page(ui, now);
 	else if (ui->nav_index == NAV_PAGE_STREAMING)
 		render_stream_page(ui, now);
 	else {
@@ -470,20 +616,51 @@ void render_scene(struct ui *ui, uint32_t now)
 			text_prewarm_visible(ui);
 		draw_library(ui, now);
 	}
-	if (ui->search_active && ui->nav_index != NAV_PAGE_SETTINGS &&
+	if (profile)
+		profile_ticks[5] = SDL_GetPerformanceCounter();
+	if (ui->network.password_active)
+		keyboard_render(ui);
+	else if (ui->search_active && ui->nav_index != NAV_PAGE_SETTINGS &&
 	    ui->nav_index != NAV_PAGE_NETWORK &&
 	    ui->nav_index != NAV_PAGE_APPS)
 		keyboard_render(ui);
 	else if (ui->quick_menu_open)
 		draw_quick_menu(ui);
 	render_controls(ui);
+	if (profile)
+		profile_ticks[6] = SDL_GetPerformanceCounter();
 	draw_action_osd(ui, now);
 	if (ui->launch.transition == LAUNCH_TRANSITION_RETURNED ||
 	    ui->launch.transition == LAUNCH_TRANSITION_ERROR)
 		draw_launch_transition(ui, now, false);
+	if (profile)
+		profile_ticks[7] = SDL_GetPerformanceCounter();
 	SDL_RenderPresent(ui->renderer);
 	text_cache_collect_retired(ui);
 	launch_transition_presented(ui);
+	if (profile) {
+		profile_ticks[8] = SDL_GetPerformanceCounter();
+		(void)fprintf(stderr,
+			"RENDER_PROFILE clear=%.3f backdrop=%.3f status=%.3f nav=%.3f content=%.3f controls=%.3f overlay=%.3f present=%.3f total=%.3f\n",
+			(double)(profile_ticks[1] - profile_ticks[0]) * 1000.0 /
+				(double)profile_frequency,
+			(double)(profile_ticks[2] - profile_ticks[1]) * 1000.0 /
+				(double)profile_frequency,
+			(double)(profile_ticks[3] - profile_ticks[2]) * 1000.0 /
+				(double)profile_frequency,
+			(double)(profile_ticks[4] - profile_ticks[3]) * 1000.0 /
+				(double)profile_frequency,
+			(double)(profile_ticks[5] - profile_ticks[4]) * 1000.0 /
+				(double)profile_frequency,
+			(double)(profile_ticks[6] - profile_ticks[5]) * 1000.0 /
+				(double)profile_frequency,
+			(double)(profile_ticks[7] - profile_ticks[6]) * 1000.0 /
+				(double)profile_frequency,
+			(double)(profile_ticks[8] - profile_ticks[7]) * 1000.0 /
+				(double)profile_frequency,
+			(double)(profile_ticks[8] - profile_ticks[0]) * 1000.0 /
+				(double)profile_frequency);
+	}
 }
 
 int render_save_screenshot(struct ui *ui, const char *path)

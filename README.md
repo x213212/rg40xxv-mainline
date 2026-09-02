@@ -122,6 +122,8 @@ two features are integrated only far enough to be honest about being unfinished.
 | Joypad, buttons, battery, audio, watchdog | works |
 | Launcher (`components/rg40xxv-shell`) | works — the screenshot is it running |
 | Device services (power, network, Bluetooth, save-guard) | works |
+| Screen off / on (`ui-hardwarectl`) | works — saves and kills the backlight only. It does not power down `fb0`, close the TCON, reset the panel or unprepare the DRM panel, because re-initialising this panel is the hard part. Verified on the device for one off/on round, not for suspend-to-RAM. |
+| **YouTube (`components/youtube`)** | **host and QEMU gates pass; every device gate is `PENDING`.** A controller-first native client: SDL texture UI, libmpv/FFmpeg for media, and `yt-dlp` confined to an owner-private resolver service that is neither the UI nor the decoder. One exact-binary run on the device logged playback, an advancing ALSA pointer and a non-uniform frame, but under `evidence_scope=COMPONENT_GATE` on a non-target p8 — which is not user visual or audio acceptance, and the tile says `VERIFY`, not READY. |
 | Boot menu, after a clean reflash with stock panel data | reached |
 | **Cold-boot panel initialisation** | **unresolved — being worked on. This is the blocker; see the warning above.** |
 | **Game streaming** | **not supported.** Only the settings backend exists: `components/netstream` stores Sunshine/Moonlight host profiles. It does not connect, does not invoke Moonlight, and no client is wired up. |
@@ -185,7 +187,9 @@ Full procedure, including how to get back to stock:
 | `configs/` | The production kernel configuration, 1,833 options. |
 | `tools/` | Identify, audit, flash and deploy scripts. |
 | `components/rg40xxv-shell` | The launcher in the screenshot. MIT. |
-| `components/device-control` | Power, network, Bluetooth, save-guard services. |
+| `components/device-control` | Power, network, save-guard, CPU policy, volume, USB debug and screen control services. |
+| `components/bluetooth-runtime` | The Bluetooth control helper, model and systemd payload. It used to be a shell script inside `device-control`; it is now a C program with its own tests. |
+| `components/youtube` | The native YouTube client. Needs `vendor/fetch-yt-dlp.sh` run once before `build.sh`. |
 | `components/netstream` | Streaming service. |
 | `docs/` | Porting notes, upstream provenance, build and flash procedure. |
 

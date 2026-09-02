@@ -2,7 +2,7 @@
 set -eu
 
 project=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-workspace=$(CDPATH= cd -- "$project/../.." && pwd -P)
+workspace=${RG40XXV_WORKSPACE:-$(CDPATH= cd -- "$project/../../../.." && pwd -P)}
 temporary=$(mktemp -d)
 ui_pid=
 trap 'if test -n "$ui_pid"; then kill -KILL "$ui_pid" 2>/dev/null || true; fi; rm -rf -- "$temporary"' EXIT HUP INT TERM

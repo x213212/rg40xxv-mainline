@@ -65,6 +65,7 @@ discover_roots() {
         /mnt/data/retroarch/states \
 		/mnt/data/rg40xxv/state/aarch64-retroarch/saves \
 		/mnt/data/rg40xxv/state/aarch64-retroarch/states \
+		/mnt/data/rg40xxv/state/easyrpg \
         /mnt/mmc/PSP/SAVEDATA \
         /mnt/mmc/PSP/PPSSPP_STATE \
         /mnt/mmc/.config/ppsspp/PSP/SAVEDATA \

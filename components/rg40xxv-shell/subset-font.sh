@@ -40,13 +40,14 @@ fi
 
 # The UI is horizontal-only: retain Latin kerning and native-size hinting but
 # omit vertical tables.  Keep the complete basic CJK ranges: ROM and port
-# titles are external data and may use Simplified Chinese characters that do
-# not occur in the built-in zh_TW strings or in the ROM set present at build
-# time.  A title must never turn into tofu merely because it was added later.
+# titles and network metadata are external data and may use Simplified Chinese
+# or Korean characters that do not occur in the built-in zh_TW strings or in
+# the ROM set present at build time.  A title must never turn into tofu merely
+# because it was added later.
 pyftsubset "$source_font" \
 	--font-number=3 \
 	--text-file="$corpus" \
-	--unicodes='U+0020-007E,U+00A0-024F,U+2000-206F,U+3000-303F,U+3100-312F,U+31A0-31BF,U+3400-4DBF,U+4E00-9FFF,U+F900-FAFF,U+FF00-FFEF' \
+	--unicodes='U+0020-007E,U+00A0-024F,U+1100-11FF,U+2000-206F,U+3000-303F,U+3100-312F,U+3130-318F,U+31A0-31BF,U+3400-4DBF,U+4E00-9FFF,U+AC00-D7AF,U+F900-FAFF,U+FF00-FFEF' \
 	--layout-features='kern' \
 	--flavor= \
 	--output-file="$output"

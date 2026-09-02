@@ -2,6 +2,7 @@
 set -euo pipefail
 
 MAX_UDC_ENTRIES=8
+USB0_WAIT_STEPS=50
 
 die() {
     printf 'usb-debugctl: %s\n' "$*" >&2
@@ -16,9 +17,16 @@ init_paths() {
         [[ -d "$test_root" && ! -L "$test_root" ]] || die '無效測試根目錄'
         configfs_root="$test_root/configfs"
         sys_root="$test_root/sys"
+        dev_root="$test_root/dev"
+        if [[ -n ${USB_DEBUG_TEST_USB0_WAIT_STEPS:-} ]]; then
+            [[ $USB_DEBUG_TEST_USB0_WAIT_STEPS =~ ^[1-9][0-9]?$ ]] || \
+                die '測試 usb0 wait steps 格式不正確'
+            USB0_WAIT_STEPS=$USB_DEBUG_TEST_USB0_WAIT_STEPS
+        fi
     else
         configfs_root=/sys/kernel/config
         sys_root=/sys
+        dev_root=/dev
     fi
     udc_root="$sys_root/class/udc"
     gadget="$configfs_root/usb_gadget/rg40xxv_debug"
@@ -54,13 +62,42 @@ write_attr() {
 
 ensure_link() {
     local target=$1 link=$2
+    local resolved_target resolved_link
+
+    [[ $target == "$gadget/"* ]] || die "symlink 目標不在本 gadget：$target"
+    [[ -e $target && ! -L $target ]] || die "symlink 目標不存在或不是 configfs item：$target"
     if [[ -L "$link" ]]; then
-        [[ $(readlink -- "$link") == "$target" ]] || die "既有 symlink 目標不符：$link"
+        resolved_target=$(realpath -e -- "$target") || \
+            die "無法解析 symlink 目標：$target"
+        resolved_link=$(realpath -e -- "$link") || \
+            die "無法解析既有 symlink：$link"
+        [[ $resolved_link == "$resolved_target" ]] || \
+            die "既有 symlink 目標不符：$link"
     elif [[ -e "$link" ]]; then
         die "既有路徑不是 symlink：$link"
     else
+        # configfs resolves the symlink target from the caller's cwd while
+        # creating an item link.  A filesystem-style ../../ target therefore
+        # fails with ENOENT when systemd starts us from /.  Always pass the
+        # absolute configfs item path; the old fixture test did not model this
+        # configfs-specific lookup rule.
         ln -s -- "$target" "$link"
     fi
+}
+
+remove_link() {
+    local target=$1 link=$2
+    local resolved_target resolved_link
+
+    [[ $target == "$gadget/"* ]] || die "symlink 目標不在本 gadget：$target"
+    [[ -L $link ]] || die "要移除的 config link 不是 symlink：$link"
+    resolved_target=$(realpath -e -- "$target") || \
+        die "無法解析 symlink 目標：$target"
+    resolved_link=$(realpath -e -- "$link") || \
+        die "無法解析既有 symlink：$link"
+    [[ $resolved_link == "$resolved_target" ]] || \
+        die "既有 symlink 目標不符：$link"
+    unlink -- "$link"
 }
 
 ensure_configfs() {
@@ -75,6 +112,57 @@ ensure_configfs() {
         fi
     fi
     [[ -d "$configfs_root/usb_gadget" ]] || die 'configfs 沒有 usb_gadget subsystem'
+}
+
+require_kernel_support() {
+    local checker=/usr/libexec/rg40xxv/check-usb-debug-kernel-config
+
+    [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]] && return
+    [[ -f $checker && ! -L $checker && -x $checker ]] || \
+        die "核心能力檢查器不可用：$checker"
+    "$checker" >/dev/null || \
+        die '目前核心缺少 RNDIS/CDC ACM configfs 支援'
+}
+
+ensure_directory() {
+    local path=$1
+
+    [[ ! -L $path ]] || die "configfs 路徑不可為 symlink：$path"
+    if [[ -e $path ]]; then
+        [[ -d $path ]] || die "configfs 路徑不是目錄：$path"
+    else
+        mkdir -- "$path"
+    fi
+}
+
+ensure_gadget_tree() {
+    # Configfs materializes configs/functions/strings/os_desc only after the
+    # gadget directory is created.  One recursive mkdir can race that
+    # materialization on the H700 kernel and reaches functions/* too early.
+    ensure_directory "$gadget"
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        ensure_directory "$gadget/configs"
+        ensure_directory "$gadget/functions"
+        ensure_directory "$gadget/strings"
+        ensure_directory "$gadget/os_desc"
+    else
+        for implicit in configs functions strings os_desc; do
+            [[ -d "$gadget/$implicit" && ! -L "$gadget/$implicit" ]] || \
+                die "核心未建立 gadget/$implicit"
+        done
+    fi
+    ensure_directory "$gadget/strings/0x409"
+    ensure_directory "$gadget/configs/c.1"
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        ensure_directory "$gadget/configs/c.1/strings"
+    else
+        [[ -d "$gadget/configs/c.1/strings" &&
+           ! -L "$gadget/configs/c.1/strings" ]] || \
+            die '核心未建立 config strings'
+    fi
+    ensure_directory "$gadget/configs/c.1/strings/0x409"
+    ensure_directory "$gadget/functions/rndis.usb0"
+    ensure_directory "$gadget/functions/acm.GS0"
 }
 
 find_udc() {
@@ -97,8 +185,39 @@ find_udc() {
     printf '%s\n' "$selected"
 }
 
+bind_udc() {
+    local udc=$1
+
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 &&
+          ${USB_DEBUG_TEST_FAIL_COMPOSITE_BIND:-0} == 1 &&
+          -L "$gadget/configs/c.1/acm.GS0" ]]; then
+        return 1
+    fi
+    write_attr "$gadget/UDC" "$udc"
+}
+
+usb0_ready() {
+    local candidate=$sys_root/class/net/usb0 resolved
+
+    [[ -L $candidate ]] || return 1
+    resolved=$(realpath -e -- "$candidate") || return 1
+    [[ $resolved == "$sys_root/devices/"* && -d $resolved && ! -L $resolved ]] || \
+        return 1
+    path_has_no_symlink "$resolved"
+}
+
+wait_for_usb0() {
+    local step
+
+    for ((step = 0; step < USB0_WAIT_STEPS; ++step)); do
+        usb0_ready && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
 start_gadget() {
-    local udc serial manufacturer product device_mac host_mac
+    local udc serial manufacturer product device_mac host_mac mode
 
     serial=${USB_DEBUG_SERIAL:-RG40XXV-DEBUG}
     manufacturer=${USB_DEBUG_MANUFACTURER:-RG40XXV Community}
@@ -111,14 +230,29 @@ start_gadget() {
     validate_mac "$device_mac"
     validate_mac "$host_mac"
 
+    # Reject an incompatible kernel before creating a partial configfs gadget.
+    require_kernel_support
     ensure_configfs
     udc=$(find_udc)
-    mkdir -p \
-        "$gadget/strings/0x409" \
-        "$gadget/configs/c.1/strings/0x409" \
-        "$gadget/functions/rndis.usb0" \
-        "$gadget/functions/acm.GS0" \
-        "$gadget/os_desc"
+    if [[ -f "$gadget/UDC" && ! -L "$gadget/UDC" && -s "$gadget/UDC" ]]; then
+        [[ $(<"$gadget/UDC") == "$udc" ]] || \
+            die 'gadget 已綁定到另一個 UDC；拒絕直接切換'
+        [[ -L "$gadget/configs/c.1/rndis.usb0" ]] || \
+            die '已綁定 gadget 缺少 RNDIS config link'
+        if [[ -d "$gadget/functions" ]] &&
+           find "$gadget/functions" -mindepth 1 -maxdepth 1 \
+               -type d -name 'mass_storage.*' | grep -q .; then
+            die '安全檢查失敗：gadget 中出現 mass_storage function'
+        fi
+        wait_for_usb0 || die '已綁定 gadget 沒有可驗證的 usb0'
+        mode=$([[ -L "$gadget/configs/c.1/acm.GS0" ]] && \
+            printf rndis+acm || printf rndis-only)
+        printf 'USB debug 已綁定 UDC=%s mode=%s usb0=ready ttyGS0=%s\n' \
+            "$udc" "$mode" \
+            "$([[ -e $dev_root/ttyGS0 && ! -L $dev_root/ttyGS0 ]] && printf ready || printf unavailable)"
+        return
+    fi
+    ensure_gadget_tree
 
     write_attr "$gadget/idVendor" 0x1d6b
     write_attr "$gadget/idProduct" 0x0104
@@ -143,20 +277,36 @@ start_gadget() {
     write_attr "$gadget/os_desc/b_vendor_code" 0xcd
     write_attr "$gadget/os_desc/qw_sign" MSFT100
 
-    ensure_link ../../functions/rndis.usb0 "$gadget/configs/c.1/rndis.usb0"
-    ensure_link ../../functions/acm.GS0 "$gadget/configs/c.1/acm.GS0"
-    ensure_link ../configs/c.1 "$gadget/os_desc/c.1"
+    ensure_link "$gadget/functions/rndis.usb0" "$gadget/configs/c.1/rndis.usb0"
+    ensure_link "$gadget/functions/acm.GS0" "$gadget/configs/c.1/acm.GS0"
+    ensure_link "$gadget/configs/c.1" "$gadget/os_desc/c.1"
 
     if find "$gadget/functions" -mindepth 1 -maxdepth 1 -type d -name 'mass_storage.*' | grep -q .; then
         die '安全檢查失敗：gadget 中出現 mass_storage function'
     fi
-    if [[ -s "$gadget/UDC" ]]; then
-        [[ $(<"$gadget/UDC") == "$udc" ]] || \
-            die 'gadget 已綁定到另一個 UDC；拒絕直接切換'
-    else
-        write_attr "$gadget/UDC" "$udc"
+    mode=rndis+acm
+    if ! bind_udc "$udc"; then
+        # The H700 MUSB endpoint budget can reject RNDIS+ACM even though both
+        # configfs functions were created successfully.  Keep network debug
+        # usable by retrying the smaller RNDIS-only configuration.  Do not
+        # report ttyGS0 in this degraded mode.
+        write_attr "$gadget/UDC" '' 2>/dev/null || true
+        remove_link "$gadget/functions/acm.GS0" \
+            "$gadget/configs/c.1/acm.GS0"
+        rmdir -- "$gadget/functions/acm.GS0" 2>/dev/null || true
+        write_attr "$gadget/configs/c.1/strings/0x409/configuration" \
+            'RNDIS debug (CDC ACM unavailable)'
+        mode=rndis-only
+        bind_udc "$udc" || die \
+            'UDC 綁定失敗（RNDIS+ACM 與 RNDIS-only 都失敗）'
     fi
-    printf 'USB debug 已綁定 UDC=%s（RNDIS usb0 + CDC ACM ttyGS0）\n' "$udc"
+    if ! wait_for_usb0; then
+        write_attr "$gadget/UDC" '' 2>/dev/null || true
+        die 'UDC 已綁定但核心未建立可驗證的 usb0'
+    fi
+    printf 'USB debug 已綁定 UDC=%s mode=%s usb0=ready ttyGS0=%s\n' \
+        "$udc" "$mode" \
+        "$([[ -e $dev_root/ttyGS0 && ! -L $dev_root/ttyGS0 ]] && printf ready || printf unavailable)"
 }
 
 stop_gadget() {
@@ -178,6 +328,8 @@ status_gadget() {
     printf 'udc=%s\n' "$bound"
     printf 'rndis=%s\n' "$([[ -L "$gadget/configs/c.1/rndis.usb0" ]] && printf enabled || printf disabled)"
     printf 'acm=%s\n' "$([[ -L "$gadget/configs/c.1/acm.GS0" ]] && printf enabled || printf disabled)"
+    printf 'usb0=%s\n' "$(usb0_ready && printf ready || printf unavailable)"
+    printf 'ttyGS0=%s\n' "$([[ -e $dev_root/ttyGS0 && ! -L $dev_root/ttyGS0 ]] && printf ready || printf unavailable)"
     printf 'mass_storage=%s\n' "$([[ -d "$gadget/functions" ]] && find "$gadget/functions" -mindepth 1 -maxdepth 1 -type d -name 'mass_storage.*' | grep -q . && printf UNSAFE || printf absent)"
 }
 

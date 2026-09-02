@@ -15,6 +15,7 @@ die() {
 }
 
 init_paths() {
+    local script_dir
     root_prefix=
     if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
         test_root=${DEVICE_CONTROL_TEST_ROOT:-}
@@ -23,6 +24,10 @@ init_paths() {
         [[ -d "$test_root/rootfs" && ! -L "$test_root/rootfs" ]] || \
             die '無效測試 rootfs'
         root_prefix="$test_root/rootfs"
+        script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+        cpu_policyctl="$script_dir/../cpu-policy/cpu-policyctl"
+    else
+        cpu_policyctl=/usr/sbin/cpu-policyctl
     fi
     sys_root="${root_prefix}/sys"
     state_dir="${root_prefix}/run/rg40xxv/power-lock"
@@ -31,6 +36,31 @@ init_paths() {
     state_file="$state_dir/state.v1"
     snapshot_file="$state_dir/hardware-snapshot.v1"
     lock_file="$state_dir/.lock"
+}
+
+run_cpu_policy() {
+    local -a clean_env=(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C)
+
+    [[ -f "$cpu_policyctl" && ! -L "$cpu_policyctl" && -x "$cpu_policyctl" ]] ||
+        return 1
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 ]]; then
+        clean_env+=(DEVICE_CONTROL_TESTING=1 DEVICE_CONTROL_TEST_ROOT="$test_root")
+        if [[ -n ${CPU_POLICY_TEST_FAIL_POLICY:-} ]]; then
+            clean_env+=(CPU_POLICY_TEST_FAIL_POLICY="$CPU_POLICY_TEST_FAIL_POLICY")
+        fi
+        if [[ -n ${CPU_POLICY_TEST_FAIL_RESTORE_POLICY:-} ]]; then
+            clean_env+=(CPU_POLICY_TEST_FAIL_RESTORE_POLICY="$CPU_POLICY_TEST_FAIL_RESTORE_POLICY")
+        fi
+    fi
+    "${clean_env[@]}" "$cpu_policyctl" "$@"
+}
+
+cpu_sleep_enter() {
+    run_cpu_policy lock-idle >/dev/null
+}
+
+cpu_sleep_exit() {
+    run_cpu_policy unlock-idle >/dev/null
 }
 
 monotonic_ms() {
@@ -276,76 +306,91 @@ resolve_snapshot_path() {
 }
 
 prepare_snapshot() {
-    local directory path output_path current maximum name lower_name index found_backlight=0 found_rgb=0 found_gpu=0
+    local required=${1:-all} directory path output_path current maximum name lower_name index
+    local found_backlight=0 found_rgb=0 found_gpu=0
+    local need_backlight=0 need_rgb=0 need_gpu=0
     local -a backlight_entries backlight_names led_entries led_names
+
+    case $required in
+        all) need_backlight=1; need_rgb=1; need_gpu=1 ;;
+        backlight_brightness) need_backlight=1 ;;
+        rgb_brightness) need_rgb=1 ;;
+        *) die '未知硬體快照範圍' ;;
+    esac
 
     SNAPSHOT_TMP=$(mktemp "$state_dir/.hardware.XXXXXX")
     printf 'version\t1\t1\n' >"$SNAPSHOT_TMP"
 
-    discover_class_entries "$sys_root/class/backlight" "$MAX_BACKLIGHT_ENTRIES" backlight
-    backlight_entries=("${DISCOVERED_DIRS[@]}")
-    backlight_names=("${DISCOVERED_NAMES[@]}")
-    for index in "${!backlight_entries[@]}"; do
-        directory=${backlight_entries[$index]}
-        name=${backlight_names[$index]}
-        output_path=$(resolve_device_attribute "$directory" brightness) || \
-            die '背光 brightness attribute 不安全'
-        current=$(read_uint_file "$output_path") || die '背光 brightness 不是數字'
-        path=$(resolve_device_attribute "$directory" max_brightness) || \
-            die '背光 max_brightness attribute 不安全'
-        maximum=$(read_uint_file "$path") || die '背光 max_brightness 不是數字'
-        ((current <= maximum)) || die '背光值超出 max_brightness'
-        snapshot_add backlight_brightness "$output_path" "$current"
-        if [[ -e $directory/bl_power || -L $directory/bl_power ]]; then
-            path=$(resolve_device_attribute "$directory" bl_power) || \
-                die '背光 bl_power attribute 不安全'
-            current=$(read_uint_file "$path") || die 'bl_power 不是數字'
-            snapshot_add backlight_power "$path" "$current"
-        fi
-        found_backlight=1
-        break
-    done
-
-    discover_class_entries "$sys_root/class/leds" "$MAX_LED_ENTRIES" LED
-    led_entries=("${DISCOVERED_DIRS[@]}")
-    led_names=("${DISCOVERED_NAMES[@]}")
-    for index in "${!led_entries[@]}"; do
-        directory=${led_entries[$index]}
-        name=${led_names[$index]}
-        lower_name=${name,,}
-        case "$lower_name" in
-            *status*|*power*) continue ;;
-            rgb:kbd_backlight|*joystick*|*stick*|*analog*|rg40xxv:left*|rg40xxv:right*) ;;
-            *) continue ;;
-        esac
-        output_path=$(resolve_device_attribute "$directory" brightness) || \
-            die 'RGB brightness attribute 不安全'
-        current=$(read_uint_file "$output_path") || die 'RGB brightness 不是數字'
-        path=$(resolve_device_attribute "$directory" max_brightness) || \
-            die 'RGB max_brightness attribute 不安全'
-        maximum=$(read_uint_file "$path") || die 'RGB max_brightness 不是數字'
-        ((current <= maximum)) || die 'RGB 值超出 max_brightness'
-        snapshot_add rgb_brightness "$output_path" "$current"
-        found_rgb=1
-    done
-
-    for path in \
-        "$sys_root/class/drm/card0/device/power/control" \
-        "$sys_root/bus/platform/devices/1800000.gpu/power/control" \
-        "$sys_root/devices/platform/1800000.gpu/power/control" \
-        "$sys_root/devices/platform/soc/1800000.gpu/power/control"; do
-        if path_has_no_symlink "$path" && [[ -f "$path" && ! -L "$path" ]]; then
-            current=$(<"$path")
-            [[ $current == auto || $current == on ]] || continue
-            snapshot_add gpu_control "$path" "$current"
-            found_gpu=1
+    if ((need_backlight)); then
+        discover_class_entries "$sys_root/class/backlight" "$MAX_BACKLIGHT_ENTRIES" backlight
+        backlight_entries=("${DISCOVERED_DIRS[@]}")
+        backlight_names=("${DISCOVERED_NAMES[@]}")
+        for index in "${!backlight_entries[@]}"; do
+            directory=${backlight_entries[$index]}
+            name=${backlight_names[$index]}
+            output_path=$(resolve_device_attribute "$directory" brightness) || \
+                die '背光 brightness attribute 不安全'
+            current=$(read_uint_file "$output_path") || die '背光 brightness 不是數字'
+            path=$(resolve_device_attribute "$directory" max_brightness) || \
+                die '背光 max_brightness attribute 不安全'
+            maximum=$(read_uint_file "$path") || die '背光 max_brightness 不是數字'
+            ((current <= maximum)) || die '背光值超出 max_brightness'
+            snapshot_add backlight_brightness "$output_path" "$current"
+            if [[ -e $directory/bl_power || -L $directory/bl_power ]]; then
+                path=$(resolve_device_attribute "$directory" bl_power) || \
+                    die '背光 bl_power attribute 不安全'
+                current=$(read_uint_file "$path") || die 'bl_power 不是數字'
+                snapshot_add backlight_power "$path" "$current"
+            fi
+            found_backlight=1
             break
-        fi
-    done
+        done
+    fi
 
-    ((found_backlight)) || die '找不到可驗證的背光 sysfs'
-    ((found_rgb)) || die '找不到可驗證的 joystick RGB sysfs'
-    ((found_gpu)) || die '找不到可驗證的 GPU runtime PM control'
+    if ((need_rgb)); then
+        discover_class_entries "$sys_root/class/leds" "$MAX_LED_ENTRIES" LED
+        led_entries=("${DISCOVERED_DIRS[@]}")
+        led_names=("${DISCOVERED_NAMES[@]}")
+        for index in "${!led_entries[@]}"; do
+            directory=${led_entries[$index]}
+            name=${led_names[$index]}
+            lower_name=${name,,}
+            case "$lower_name" in
+                *status*|*power*) continue ;;
+                rgb:kbd_backlight|*joystick*|*stick*|*analog*|rg40xxv:left*|rg40xxv:right*) ;;
+                *) continue ;;
+            esac
+            output_path=$(resolve_device_attribute "$directory" brightness) || \
+                die 'RGB brightness attribute 不安全'
+            current=$(read_uint_file "$output_path") || die 'RGB brightness 不是數字'
+            path=$(resolve_device_attribute "$directory" max_brightness) || \
+                die 'RGB max_brightness attribute 不安全'
+            maximum=$(read_uint_file "$path") || die 'RGB max_brightness 不是數字'
+            ((current <= maximum)) || die 'RGB 值超出 max_brightness'
+            snapshot_add rgb_brightness "$output_path" "$current"
+            found_rgb=1
+        done
+    fi
+
+    if ((need_gpu)); then
+        for path in \
+            "$sys_root/class/drm/card0/device/power/control" \
+            "$sys_root/bus/platform/devices/1800000.gpu/power/control" \
+            "$sys_root/devices/platform/1800000.gpu/power/control" \
+            "$sys_root/devices/platform/soc/1800000.gpu/power/control"; do
+            if path_has_no_symlink "$path" && [[ -f "$path" && ! -L "$path" ]]; then
+                current=$(<"$path")
+                [[ $current == auto || $current == on ]] || continue
+                snapshot_add gpu_control "$path" "$current"
+                found_gpu=1
+                break
+            fi
+        done
+    fi
+
+    ((!need_backlight || found_backlight)) || die '找不到可驗證的背光 sysfs'
+    ((!need_rgb || found_rgb)) || die '找不到可驗證的 joystick RGB sysfs'
+    ((!need_gpu || found_gpu)) || die '找不到可驗證的 GPU runtime PM control'
     chmod 0600 "$SNAPSHOT_TMP"
     mv -f -- "$SNAPSHOT_TMP" "$snapshot_file"
     SNAPSHOT_TMP=
@@ -450,7 +495,7 @@ set_output_percent() {
         *) die '未知輸出類型' ;;
     esac
 
-    prepare_snapshot
+    prepare_snapshot "$kind"
     PERCENT_KIND=$kind
     PERCENT_VALUE=$value
     FAIL_SEEN=0
@@ -486,8 +531,25 @@ hardware_screen_on() {
     esac
 }
 
+hardware_recover_awake() {
+    case $MODE in
+        screen_off|light_sleep|locking)
+            transition_awake
+            ;;
+        awake|lock_screen)
+            cpu_sleep_exit || return 1
+            printf 'ACTION_RECOVERY_NOT_NEEDED\n'
+            ;;
+        shutdown_requested)
+            die 'orderly shutdown 已開始，拒絕復原成 awake'
+            ;;
+    esac
+}
+
 force_off_best_effort() {
     POWER_LOCK_TEST_FAIL_STEP=
+    CPU_POLICY_TEST_FAIL_POLICY=
+    cpu_sleep_enter >/dev/null 2>&1 || true
     outputs_off >/dev/null 2>&1 || true
 }
 
@@ -501,6 +563,11 @@ transition_screen_off() {
         action=ACTION_SCREEN_OFF_LIGHT_SLEEP
     fi
     prepare_snapshot
+    if ! cpu_sleep_enter; then
+        LAST_ACTION=ERROR_CPU_POWER_SAVE_FAILED
+        save_state
+        return 1
+    fi
     MODE=locking
     UI_MODE=paused
     LAST_ACTION=ACTION_PAUSE_RENDERING
@@ -508,6 +575,7 @@ transition_screen_off() {
     if ! outputs_off; then
         POWER_LOCK_TEST_FAIL_STEP=
         outputs_restore >/dev/null 2>&1 || true
+        cpu_sleep_exit >/dev/null 2>&1 || true
         MODE=$old_mode
         UI_MODE=$old_ui
         LAST_ACTION=ERROR_HARDWARE_OFF_ROLLED_BACK
@@ -525,6 +593,9 @@ transition_screen_off() {
 }
 
 transition_lock_screen() {
+    local cpu_restore_failed=0
+
+    cpu_sleep_exit || cpu_restore_failed=1
     if ! outputs_restore; then
         force_off_best_effort
         MODE=screen_off
@@ -540,10 +611,16 @@ transition_lock_screen() {
     UNLOCK_LAST_MS=0
     LAST_ACTION=ACTION_SHOW_LOCK_SCREEN
     save_state
+    if ((cpu_restore_failed)); then
+        printf '%s\n' 'power-lockctl: CPU governor 還原待重試；顯示已安全喚醒' >&2
+    fi
     printf '%s\n' "$LAST_ACTION"
 }
 
 transition_awake() {
+    local cpu_restore_failed=0
+
+    cpu_sleep_exit || cpu_restore_failed=1
     if ! outputs_restore; then
         force_off_best_effort
         MODE=light_sleep
@@ -559,6 +636,9 @@ transition_awake() {
     UNLOCK_LAST_MS=0
     LAST_ACTION=ACTION_WAKE_RESTORED
     save_state
+    if ((cpu_restore_failed)); then
+        printf '%s\n' 'power-lockctl: CPU governor 還原待重試；顯示已安全喚醒' >&2
+    fi
     printf '%s\n' "$LAST_ACTION"
 }
 
@@ -778,6 +858,10 @@ case ${1:-} in
                 (($# == 2)) || die 'hardware screen-on 不接受額外參數'
                 hardware_screen_on
                 ;;
+            recover-awake)
+                (($# == 2)) || die 'hardware recover-awake 不接受額外參數'
+                hardware_recover_awake
+                ;;
             brightness)
                 (($# == 3)) || die 'hardware brightness 需要 0..100'
                 set_output_percent backlight_brightness "$3"
@@ -786,7 +870,7 @@ case ${1:-} in
                 (($# == 3)) || die 'hardware joystick-rgb 需要 0..100'
                 set_output_percent rgb_brightness "$3"
                 ;;
-            *) die 'hardware 只接受 screen-off/screen-on/brightness/joystick-rgb' ;;
+            *) die 'hardware 只接受 screen-off/screen-on/recover-awake/brightness/joystick-rgb' ;;
         esac
         ;;
     *)
@@ -794,7 +878,7 @@ case ${1:-} in
         printf '      %s event {power-down|power-up|button <按鍵>}\n' "$0" >&2
         printf '      %s tick\n' "$0" >&2
         printf '      %s config {get lock-enabled|set lock-enabled true|false}\n' "$0" >&2
-        printf '      %s hardware {screen-off|screen-on|brightness 0..100|joystick-rgb 0..100}\n' "$0" >&2
+        printf '      %s hardware {screen-off|screen-on|recover-awake|brightness 0..100|joystick-rgb 0..100}\n' "$0" >&2
         exit 2
         ;;
 esac

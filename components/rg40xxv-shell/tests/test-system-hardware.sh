@@ -2,7 +2,7 @@
 set -eu
 
 project=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-workspace=$(CDPATH= cd -- "$project/../.." && pwd -P)
+workspace=${RG40XXV_WORKSPACE:-$(CDPATH= cd -- "$project/../../../.." && pwd -P)}
 rootfs="$workspace/firmware/mnt/rootfs"
 temporary=$(mktemp -d)
 trap 'status=$?; trap - EXIT; rm -rf -- "$temporary"; exit "$status"' \
@@ -11,6 +11,9 @@ trap 'status=$?; trap - EXIT; rm -rf -- "$temporary"; exit "$status"' \
 valid="$temporary/valid"
 hwmon="$temporary/hwmon"
 bad="$temporary/bad"
+legacy_stamp="$temporary/legacy-stamp"
+future_stamp="$temporary/future-stamp"
+persistent_stamp="$temporary/persistent-stamp"
 binary="$temporary/hardware-fixture-test"
 rom_root="$temporary/roms"
 state_dir="$temporary/netstream"
@@ -21,7 +24,7 @@ loader="$rootfs/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
 library_path="$rootfs/usr/lib/aarch64-linux-gnu:$rootfs/usr/lib"
 
 mkdir -p \
-	"$valid/run/rg40xxv-ui" "$valid/run/systemd/timesync" \
+	"$valid/run/rg40xxv-ui" "$valid/run/rg40xxv" \
 	"$valid/proc/sys/kernel" "$valid/proc/net" \
 	"$valid/sys/class/net/wlan0" \
 	"$valid/sys/class/power_supply/battery" \
@@ -30,7 +33,7 @@ mkdir -p \
 	"$valid/sys/devices/system/cpu/cpufreq/policy0" \
 	"$valid/sys/class/thermal/thermal_zone0"
 printf '%s\n' 1787632440 >"$valid/run/rg40xxv-ui/time.epoch"
-: >"$valid/run/systemd/timesync/synchronized"
+printf '%s\n' 1787632440 >"$valid/run/rg40xxv/time-sync-success"
 printf '%s\n' 'volume_percent=64' 'muted=0' \
 	>"$valid/run/rg40xxv-ui/alsa-volume"
 printf '%s\n' '7.2.0-rg40xxv-fixture' \
@@ -86,6 +89,21 @@ printf '%s\n' 1416000000 \
 printf '%s\n' 1100000 \
 	>"$bad/sys/kernel/debug/opp/cpu/opp:1416000000/supply-0/u_volt_target"
 
+# systemd-timesyncd is masked on the target, so its legacy marker is not our
+# evidence. The helper-owned stamp must also agree with CLOCK_REALTIME.
+mkdir -p "$legacy_stamp/run/rg40xxv-ui" \
+	"$legacy_stamp/run/systemd/timesync" \
+	"$future_stamp/run/rg40xxv-ui" "$future_stamp/run/rg40xxv" \
+	"$persistent_stamp/run/rg40xxv-ui" \
+	"$persistent_stamp/mnt/data/rg40xxv/state"
+printf '%s\n' 1787632440 >"$legacy_stamp/run/rg40xxv-ui/time.epoch"
+: >"$legacy_stamp/run/systemd/timesync/synchronized"
+printf '%s\n' 1787632440 >"$future_stamp/run/rg40xxv-ui/time.epoch"
+printf '%s\n' 1787632441 >"$future_stamp/run/rg40xxv/time-sync-success"
+printf '%s\n' 1787632440 >"$persistent_stamp/run/rg40xxv-ui/time.epoch"
+printf '%s\n' 1787632440 \
+	>"$persistent_stamp/mnt/data/rg40xxv/state/time-sync-success"
+
 aarch64-linux-gnu-gcc-12 -std=c11 -O2 -Wall -Wextra -Werror \
 	-I"$project/include" -I"$project/src" -idirafter "$rootfs/usr/include" \
 	"$project/src/hardware.c" "$project/src/hardware_io.c" \
@@ -100,6 +118,12 @@ qemu-aarch64-static "$loader" --library-path "$library_path" \
 	"$binary" "$hwmon" hwmon
 timeout 3 qemu-aarch64-static "$loader" --library-path "$library_path" \
 	"$binary" "$bad" unavailable
+qemu-aarch64-static "$loader" --library-path "$library_path" \
+	"$binary" "$legacy_stamp" unsynced
+qemu-aarch64-static "$loader" --library-path "$library_path" \
+	"$binary" "$future_stamp" unsynced
+qemu-aarch64-static "$loader" --library-path "$library_path" \
+	"$binary" "$persistent_stamp" persistent-sync
 
 SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
 	qemu-aarch64-static "$loader" --library-path "$library_path" \

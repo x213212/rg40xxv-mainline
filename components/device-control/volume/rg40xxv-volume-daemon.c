@@ -1028,11 +1028,20 @@ static int commit_state(struct daemon_state *state, int volume_percent, int mute
 		return -1;
 	if (apply_controls(state, volume_percent, muted) != 0)
 		goto rollback;
-	if (publish_state(state, volume_percent, muted) != 0)
-		goto rollback;
-	marker_published = true;
+	/*
+	 * Commit durable state before publishing the runtime marker.  Readers use
+	 * that marker as the transaction-complete signal, so publishing it first
+	 * exposed a short window where the UI reported the new volume while
+	 * volume.v1 still contained the previous (or malformed) state.
+	 */
 	persistence_attempted = true;
 	if (persist_state(state, volume_percent, muted, next_last_nonzero) != 0)
+		goto rollback;
+	/* publish_state() may have renamed its temporary file before a directory
+	 * fsync fails.  Mark the attempt before calling it so rollback repairs or
+	 * removes the public marker in either case. */
+	marker_published = true;
+	if (publish_state(state, volume_percent, muted) != 0)
 		goto rollback;
 	state->volume_percent = volume_percent;
 	state->muted = muted;
@@ -1056,10 +1065,20 @@ rollback:
 				(void)fsync(state->ui_dir_fd);
 			}
 		}
-		if (persistence_attempted && was_initialized &&
-		    persist_state(state, previous_volume, previous_muted,
-				  previous_last_nonzero) != 0)
-			log_message("persistent state rollback failed");
+		if (persistence_attempted) {
+			if (was_initialized) {
+				if (persist_state(state, previous_volume,
+						  previous_muted,
+						  previous_last_nonzero) != 0)
+					log_message("persistent state rollback failed");
+			} else if (unlinkat(state->persistent_dir_fd,
+					    PERSISTENT_STATE_NAME, 0) != 0 &&
+				   errno != ENOENT) {
+				log_message("initial persistent state rollback failed");
+			} else if (fsync(state->persistent_dir_fd) != 0) {
+				log_message("initial persistent directory rollback failed");
+			}
+		}
 		errno = saved_errno;
 		return -1;
 	}
@@ -1110,6 +1129,19 @@ static int prepare_runtime(struct daemon_state *state)
 		return -1;
 	state->ui_dir_fd = open(ui_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (state->ui_dir_fd < 0)
+		return -1;
+	/*
+	 * alsa-volume is a readiness marker for this daemon instance, not a
+	 * durable setting.  /run survives a service restart, so leaving the old
+	 * marker in place lets readers observe the previous state after the new
+	 * socket is bound but before the cold-start ALSA transaction has restored
+	 * the mixer.  Remove it before publishing the socket; commit_state() will
+	 * atomically recreate it only after ALSA and volume.v1 are both committed.
+	 * unlinkat() removes a hostile symlink itself and never follows its target.
+	 */
+	if (unlinkat(state->ui_dir_fd, "alsa-volume", 0) != 0 && errno != ENOENT)
+		return -1;
+	if (fsync(state->ui_dir_fd) != 0)
 		return -1;
 	if (lstat(state->socket_path, &socket_status) == 0) {
 		if (!S_ISSOCK(socket_status.st_mode) || socket_status.st_uid != geteuid()) {

@@ -9,8 +9,18 @@ set -euo pipefail
 release=cab71c59e8c5a4c42220f856f8acb6c09bbc1a188ba2cdcdf2a16f7219c0cc59
 archive_sha=b07a0ad3afbe9b526ef0853fd9c142d4bbfac0121cb17eb9413e91a0b61688e9
 p8_sha=6455c4d82d1594c03ab4f799c276da7249c6ffefd6fa22dd55b9077b1dfd4be3
-device=${RG40XXV_DEVICE:-root@192.168.0.125}
-password=${RG40XXV_PASSWORD:-root}
+device=${RG40XXV_DEVICE:-PUT-YOUR-OWN-DEVICE-HERE}
+password=${RG40XXV_PASSWORD:-}
+
+# These scripts talk to a handheld over SSH. The address and the password are
+# whoever is running them, so there is no useful default: set RG40XXV_DEVICE and
+# RG40XXV_PASSWORD. The refusal below is the guard working, not a bug.
+case "$device" in
+PUT-YOUR-OWN-DEVICE-HERE)
+	printf '%s\n' 'set RG40XXV_DEVICE=user@host for your own device' >&2
+	exit 2 ;;
+esac
+[ -n "$password" ] || { printf '%s\n' 'set RG40XXV_PASSWORD' >&2; exit 2; }
 known_hosts=${RG40XXV_KNOWN_HOSTS:-${KERNEL_LAB_ROOT}/firmware/live/known_hosts}
 workspace=${KERNEL_LAB_ROOT}
 build=$workspace/lab/deploy/rg40xxv-next-v1/build

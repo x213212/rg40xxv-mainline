@@ -10,6 +10,11 @@
 #include <sys/statvfs.h>
 #include <time.h>
 
+#define TIME_SYNC_RUNTIME_STAMP "/run/rg40xxv/time-sync-success"
+#define TIME_SYNC_PERSISTENT_STAMP "/mnt/data/rg40xxv/state/time-sync-success"
+#define TIME_SYNC_MINIMUM_EPOCH INT64_C(1704067200)
+#define TIME_SYNC_MAXIMUM_EPOCH INT64_C(4102444800)
+
 static int64_t snapshot_epoch(const struct hardware_backend *backend)
 {
 	char path[PATH_MAX];
@@ -26,10 +31,35 @@ static int64_t snapshot_epoch(const struct hardware_backend *backend)
 	return (int64_t)now.tv_sec;
 }
 
+static int synchronization_stamp_valid(const struct hardware_backend *backend,
+				       int64_t clock_epoch)
+{
+	static const char *const stamps[] = {
+		TIME_SYNC_RUNTIME_STAMP,
+		TIME_SYNC_PERSISTENT_STAMP,
+	};
+	char path[PATH_MAX];
+	int64_t stamp_epoch;
+
+	if (clock_epoch < TIME_SYNC_MINIMUM_EPOCH ||
+	    clock_epoch >= TIME_SYNC_MAXIMUM_EPOCH)
+		return 0;
+	for (size_t index = 0; index < sizeof(stamps) / sizeof(stamps[0]);
+	     ++index) {
+		if (hw_path(path, sizeof(path), backend, stamps[index]) != 0)
+			continue;
+		stamp_epoch = hw_read_number(path, TIME_SYNC_MINIMUM_EPOCH,
+					     TIME_SYNC_MAXIMUM_EPOCH - 1);
+		/* The helper publishes only after ntpdate and hwclock both succeed. */
+		if (stamp_epoch >= 0 && stamp_epoch <= clock_epoch)
+			return 1;
+	}
+	return 0;
+}
+
 void hw_refresh_datetime(const struct hardware_backend *backend,
 			 struct hardware_datetime *datetime)
 {
-	char path[PATH_MAX];
 	int64_t epoch = snapshot_epoch(backend);
 	time_t taipei_epoch;
 
@@ -41,9 +71,7 @@ void hw_refresh_datetime(const struct hardware_backend *backend,
 			datetime->available = 1;
 		}
 	}
-	if (hw_path(path, sizeof(path), backend,
-		    "/run/systemd/timesync/synchronized") == 0 &&
-	    hw_regular_exists(path))
+	if (synchronization_stamp_valid(backend, epoch))
 		datetime->time_synced = 1;
 }
 
@@ -141,19 +169,41 @@ static void refresh_cpu_basic(const struct hardware_backend *backend,
 		cpu->load_1m = cpu->load_5m = cpu->load_15m = -1.0;
 }
 
-static void refresh_cpu_temperature(const struct hardware_backend *backend,
+static void refresh_cpu_temperature(struct hardware_backend *backend,
 				    struct hardware_cpu *cpu)
 {
 	char root[PATH_MAX];
 	char path[PATH_MAX];
+	char name[64];
 	char type[64];
 	struct dirent *entry;
 	DIR *directory;
 	unsigned int seen = 0;
+	int remembered = 0;
 
-	if (hw_path(root, sizeof(root), backend, "/sys/class/thermal") != 0 ||
-	    (directory = hw_open_directory(root)) == NULL)
+	if (hw_path(root, sizeof(root), backend, "/sys/class/thermal") != 0)
 		return;
+	if (hw_discovery_cached_device(backend, HW_DISCOVERY_THERMAL, root,
+				       name, sizeof(name), NULL, 0) == 0) {
+		int64_t value;
+
+		if (hw_device_path(path, sizeof(path), root, name, "type") == 0 &&
+		    hw_read_text(path, type, sizeof(type)) == 0 &&
+		    hw_contains_casefold(type, "cpu") &&
+		    (value = hw_device_number(root, name, "temp", -40000, 200000)) >=
+			-40000) {
+			cpu->temperature_millic = (int)value;
+			return;
+		}
+		hw_discovery_forget(backend, HW_DISCOVERY_THERMAL);
+	}
+	if (!hw_discovery_should_scan(backend, HW_DISCOVERY_THERMAL))
+		return;
+	directory = hw_discovery_open_directory(backend, root);
+	if (directory == NULL) {
+		hw_discovery_mark_missing(backend, HW_DISCOVERY_THERMAL);
+		return;
+	}
 	while (seen++ < HW_DIRECTORY_ENTRY_MAX &&
 	       (entry = readdir(directory)) != NULL) {
 		int64_t value;
@@ -165,11 +215,17 @@ static void refresh_cpu_temperature(const struct hardware_backend *backend,
 		    !hw_contains_casefold(type, "cpu"))
 			continue;
 		value = hw_device_number(root, entry->d_name, "temp", -40000, 200000);
-		if (value >= -40000)
+		if (value >= -40000 &&
+		    hw_discovery_remember(backend, HW_DISCOVERY_THERMAL, root,
+					  entry->d_name, "temp") == 0) {
 			cpu->temperature_millic = (int)value;
+			remembered = 1;
+		}
 		break;
 	}
 	(void)closedir(directory);
+	if (!remembered)
+		hw_discovery_mark_missing(backend, HW_DISCOVERY_THERMAL);
 }
 
 static int cpu_voltage_label(const char *name)
@@ -181,19 +237,36 @@ static int cpu_voltage_label(const char *name)
 		strcmp(name, "CPU") == 0 || strcmp(name, "cpu") == 0;
 }
 
-static int64_t regulator_voltage(const struct hardware_backend *backend)
+static int64_t regulator_voltage(struct hardware_backend *backend)
 {
 	char root[PATH_MAX];
 	char path[PATH_MAX];
+	char device[64];
 	char name[128];
 	struct dirent *entry;
 	DIR *directory;
 	unsigned int seen = 0;
 	int64_t value = -1;
 
-	if (hw_path(root, sizeof(root), backend, "/sys/class/regulator") != 0 ||
-	    (directory = hw_open_directory(root)) == NULL)
+	if (hw_path(root, sizeof(root), backend, "/sys/class/regulator") != 0)
 		return -1;
+	if (hw_discovery_cached_device(backend, HW_DISCOVERY_REGULATOR, root,
+				       device, sizeof(device), NULL, 0) == 0) {
+		if (hw_device_path(path, sizeof(path), root, device, "name") == 0 &&
+		    hw_read_text(path, name, sizeof(name)) == 0 &&
+		    cpu_voltage_label(name) &&
+		    (value = hw_device_number(root, device, "microvolts", 1,
+					      INT_MAX)) > 0)
+			return value;
+		hw_discovery_forget(backend, HW_DISCOVERY_REGULATOR);
+	}
+	if (!hw_discovery_should_scan(backend, HW_DISCOVERY_REGULATOR))
+		return -1;
+	directory = hw_discovery_open_directory(backend, root);
+	if (directory == NULL) {
+		hw_discovery_mark_missing(backend, HW_DISCOVERY_REGULATOR);
+		return -1;
+	}
 	while (seen++ < HW_DIRECTORY_ENTRY_MAX &&
 	       (entry = readdir(directory)) != NULL) {
 		if (!hw_valid_component(entry->d_name) ||
@@ -203,24 +276,57 @@ static int64_t regulator_voltage(const struct hardware_backend *backend)
 			continue;
 		value = hw_device_number(root, entry->d_name, "microvolts", 1,
 					 INT_MAX);
-		if (value > 0)
+		if (value > 0 &&
+		    hw_discovery_remember(backend, HW_DISCOVERY_REGULATOR, root,
+					  entry->d_name, "microvolts") == 0)
 			break;
+		value = -1;
 	}
 	(void)closedir(directory);
+	if (value < 0)
+		hw_discovery_mark_missing(backend, HW_DISCOVERY_REGULATOR);
 	return value;
 }
 
-static int64_t hwmon_voltage(const struct hardware_backend *backend)
+static int64_t hwmon_voltage(struct hardware_backend *backend)
 {
 	char root[PATH_MAX];
+	char device[64];
+	char input_name[32];
 	struct dirent *entry;
 	DIR *directory;
 	unsigned int seen = 0;
 	int64_t result = -1;
 
-	if (hw_path(root, sizeof(root), backend, "/sys/class/hwmon") != 0 ||
-	    (directory = hw_open_directory(root)) == NULL)
+	if (hw_path(root, sizeof(root), backend, "/sys/class/hwmon") != 0)
 		return -1;
+	if (hw_discovery_cached_device(backend, HW_DISCOVERY_HWMON, root,
+				       device, sizeof(device), input_name,
+				       sizeof(input_name)) == 0) {
+		unsigned int channel;
+		char label_name[32];
+		char path[PATH_MAX];
+		char label[128];
+		int64_t millivolts;
+
+		if (sscanf(input_name, "in%u_input", &channel) == 1 && channel < 32) {
+			(void)snprintf(label_name, sizeof(label_name), "in%u_label", channel);
+			if (hw_device_path(path, sizeof(path), root, device, label_name) == 0 &&
+			    hw_read_text(path, label, sizeof(label)) == 0 &&
+			    cpu_voltage_label(label) &&
+			    (millivolts = hw_device_number(root, device, input_name, 1,
+							100000)) > 0)
+				return millivolts * 1000;
+		}
+		hw_discovery_forget(backend, HW_DISCOVERY_HWMON);
+	}
+	if (!hw_discovery_should_scan(backend, HW_DISCOVERY_HWMON))
+		return -1;
+	directory = hw_discovery_open_directory(backend, root);
+	if (directory == NULL) {
+		hw_discovery_mark_missing(backend, HW_DISCOVERY_HWMON);
+		return -1;
+	}
 	while (seen++ < HW_DIRECTORY_ENTRY_MAX &&
 	       (entry = readdir(directory)) != NULL && result < 0) {
 		if (!hw_valid_component(entry->d_name))
@@ -241,16 +347,20 @@ static int64_t hwmon_voltage(const struct hardware_backend *backend)
 			(void)snprintf(input_name, sizeof(input_name), "in%u_input", channel);
 			millivolts = hw_device_number(root, entry->d_name, input_name,
 						     1, 100000);
-			if (millivolts > 0)
+			if (millivolts > 0 &&
+			    hw_discovery_remember(backend, HW_DISCOVERY_HWMON, root,
+						  entry->d_name, input_name) == 0)
 				result = millivolts * 1000;
 			break;
 		}
 	}
 	(void)closedir(directory);
+	if (result < 0)
+		hw_discovery_mark_missing(backend, HW_DISCOVERY_HWMON);
 	return result;
 }
 
-void hw_refresh_cpu(const struct hardware_backend *backend,
+void hw_refresh_cpu(struct hardware_backend *backend,
 		    struct hardware_cpu *cpu)
 {
 	refresh_cpu_basic(backend, cpu);

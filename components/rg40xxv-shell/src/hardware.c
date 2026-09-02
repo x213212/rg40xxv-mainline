@@ -12,6 +12,9 @@ static void unavailable_text(char *out, size_t size)
 	(void)snprintf(out, size, "%s", HARDWARE_TEXT_UNAVAILABLE);
 }
 
+_Static_assert(HW_DISCOVERY_SLOT_COUNT == HARDWARE_DISCOVERY_CACHE_MAX,
+	       "hardware discovery cache size must remain fixed");
+
 void hardware_backend_init(struct hardware_backend *backend)
 {
 	if (backend == NULL)
@@ -31,6 +34,8 @@ int hardware_backend_set_fixture_root(struct hardware_backend *backend,
 	    realpath(root, resolved) == NULL || lstat(resolved, &status) != 0 ||
 	    !S_ISDIR(status.st_mode))
 		return -1;
+	if (strcmp(backend->fixture_root, resolved) != 0)
+		hw_discovery_cache_reset(backend);
 	if (snprintf(backend->fixture_root, sizeof(backend->fixture_root), "%s",
 		     resolved) >= (int)sizeof(backend->fixture_root) ||
 	    snprintf(backend->storage_path, sizeof(backend->storage_path), "%s",
@@ -38,6 +43,12 @@ int hardware_backend_set_fixture_root(struct hardware_backend *backend,
 		return -1;
 	backend->fixture_mode = strcmp(resolved, "/") != 0;
 	return 0;
+}
+
+uint64_t hardware_backend_discovery_scans(
+	const struct hardware_backend *backend)
+{
+	return backend != NULL ? backend->discovery_scan_count : 0;
 }
 
 void hardware_snapshot_init(struct hardware_snapshot *snapshot)
@@ -144,12 +155,13 @@ const char *hardware_battery_status_label(enum hardware_battery_status status)
 	return HARDWARE_TEXT_UNAVAILABLE;
 }
 
-int hardware_refresh(const struct hardware_backend *backend,
+int hardware_refresh(struct hardware_backend *backend,
 		     struct hardware_snapshot *snapshot, int include_wifi)
 {
 	if (backend == NULL || snapshot == NULL ||
 	    backend->fixture_root[0] != '/' || backend->storage_path[0] != '/')
 		return -1;
+	hw_discovery_begin_refresh(backend);
 	hardware_snapshot_init(snapshot);
 	hw_refresh_datetime(backend, &snapshot->datetime);
 	if (include_wifi)

@@ -139,6 +139,20 @@ static void test_tick_wrap_and_bounds(void)
 	assert(input_latch_update(&latch, 8U));
 }
 
+static void test_activation_release_guard(void)
+{
+	struct input_activation_guard guard;
+
+	input_activation_guard_init(&guard);
+	assert(input_activation_guard_consume(&guard));
+	/* SDL and raw evdev may both report the same physical down edge. */
+	assert(!input_activation_guard_consume(&guard));
+	assert(!input_activation_guard_consume(&guard));
+	input_activation_guard_release(&guard);
+	assert(input_activation_guard_consume(&guard));
+	assert(!input_activation_guard_consume(&guard));
+}
+
 static void test_evdev_control_classification(void)
 {
 	static const unsigned int mainline[] = {
@@ -276,6 +290,7 @@ int main(void)
 	test_held_activation_and_reacquire();
 	test_all_controls_must_release_and_bounce_restarts();
 	test_tick_wrap_and_bounds();
+	test_activation_release_guard();
 	test_evdev_control_classification();
 	test_evdev_snapshot_and_fail_closed_recovery();
 	puts("INPUT_LATCH_TEST PASS boot=reacquire neutral_ms=120 controls=buttons+dpad+axes");

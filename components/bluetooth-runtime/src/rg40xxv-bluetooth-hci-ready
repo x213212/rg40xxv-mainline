@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SAFE_PATH=/usr/sbin:/usr/bin:/sbin:/bin
+PATH=$SAFE_PATH
+LC_ALL=C
+export PATH LC_ALL
+
+FIRMWARE_SHA=3baa2eeaa43c959054687a67771e7435e73b2ff3e79dfb765121d8b7dc719391
+CONFIG_SHA=6ddeb15f23588053e00cb08d25588bd7cf98d60fa93d9478efcef4ae8064a7ac
+SERIAL_DEVICE=serial0-0
+DRIVER_NAME=hci_uart_h5
+MAX_READY_POLLS=50
+
+die()
+{
+	printf 'BLUETOOTH_HCI_READY result=FAIL reason=%s\n' "$1" >&2
+	exit 1
+}
+
+init_paths()
+{
+	local test_root resolved
+
+	if [[ ${RG40XXV_BT_HCI_TESTING:-0} == 1 ]]; then
+		test_root=${RG40XXV_BT_HCI_TEST_ROOT:-}
+		[[ $test_root == /tmp/rg40xxv-bluetooth-hci-test.* ]] ||
+			die unsafe-test-root
+		resolved=$(realpath -e -- "$test_root") || die unsafe-test-root
+		[[ $resolved == "$test_root" && -d $test_root && ! -L $test_root ]] ||
+			die unsafe-test-root
+		root=$test_root/rootfs
+		sys=$test_root/sys
+		hciconfig=$test_root/mock-bin/hciconfig
+	else
+		root=
+		sys=/sys
+		hciconfig=/usr/bin/hciconfig
+	fi
+	firmware=$root/usr/lib/firmware/rtl_bt/rtl8821cs_fw.bin
+	config=$root/usr/lib/firmware/rtl_bt/rtl8821cs_config.bin
+	driver=$sys/bus/serial/drivers/$DRIVER_NAME
+	status_dir=$root/run/rg40xxv/bluetooth
+}
+
+validate_inputs()
+{
+	local actual metadata mode
+
+	((EUID == 0)) || die root-required
+	for file in "$firmware" "$config"; do
+		[[ -f $file && ! -L $file ]] || die "firmware-missing:$file"
+	done
+	actual=$(/usr/bin/sha256sum -- "$firmware" | /usr/bin/awk '{print $1}')
+	[[ $actual == "$FIRMWARE_SHA" ]] || die firmware-sha
+	actual=$(/usr/bin/sha256sum -- "$config" | /usr/bin/awk '{print $1}')
+	[[ $actual == "$CONFIG_SHA" ]] || die config-sha
+	[[ -d $driver && ! -L $driver ]] || die serial-driver-missing
+	for attribute in bind unbind; do
+		[[ -f $driver/$attribute && ! -L $driver/$attribute &&
+		   -w $driver/$attribute ]] || die "unsafe-driver-$attribute"
+	done
+	metadata=$(stat -c '%u:%g:%a' -- "$hciconfig" 2>/dev/null || true)
+	mode=${metadata##*:}
+	[[ -f $hciconfig && ! -L $hciconfig && -x $hciconfig &&
+	   $metadata == 0:0:* && $mode =~ ^[0-7]{3,4}$ ]] ||
+		die unsafe-hciconfig
+	(((8#$mode & 8#022) == 0)) || die unsafe-hciconfig-mode
+	if [[ -e $status_dir ]]; then
+		[[ -d $status_dir && ! -L $status_dir ]] || die unsafe-status-dir
+	else
+		/usr/bin/install -d -o root -g root -m 0700 -- "$status_dir"
+	fi
+	exec 9>"$status_dir/.hci-ready.lock"
+	/usr/bin/flock -x 9
+}
+
+read_hci()
+{
+	HCI_OUTPUT=$($hciconfig hci0 2>/dev/null) || return 1
+	if [[ $HCI_OUTPUT =~ BD\ Address:\ ([[:xdigit:]:]{17})[[:space:]]+ACL\ MTU:\ ([0-9]+):([0-9]+) ]]; then
+		HCI_ADDRESS=${BASH_REMATCH[1]^^}
+		HCI_ACL_MTU=${BASH_REMATCH[2]}
+		HCI_ACL_PACKETS=${BASH_REMATCH[3]}
+	else
+		return 1
+	fi
+	[[ $HCI_ADDRESS != 00:00:00:00:00:00 && $HCI_ACL_MTU != 0 &&
+	   $HCI_ACL_PACKETS != 0 ]]
+}
+
+hci_is_up()
+{
+	[[ $HCI_OUTPUT == *"UP RUNNING"* || $HCI_OUTPUT == *$'UP \n'* ]]
+}
+
+wait_transport_ready()
+{
+	local unused
+
+	for ((unused = 0; unused < MAX_READY_POLLS; ++unused)); do
+		if read_hci; then
+			return 0
+		fi
+		/usr/bin/sleep 0.1
+	done
+	return 1
+}
+
+wait_adapter_up()
+{
+	local unused
+
+	for ((unused = 0; unused < MAX_READY_POLLS; ++unused)); do
+		if read_hci && hci_is_up; then
+			return 0
+		fi
+		/usr/bin/sleep 0.1
+	done
+	return 1
+}
+
+publish_ready()
+{
+	local temporary
+
+	temporary=$(/usr/bin/mktemp "$status_dir/.hci-ready.XXXXXX")
+	chmod 0600 "$temporary"
+	printf '%s\n' \
+		'RG40XXV_BLUETOOTH_HCI_READY 1' \
+		'state=READY' \
+		"driver=$DRIVER_NAME" \
+		"device=$SERIAL_DEVICE" \
+		"address=$HCI_ADDRESS" \
+		"firmware_sha256=$FIRMWARE_SHA" \
+		"config_sha256=$CONFIG_SHA" >"$temporary"
+	mv -f -- "$temporary" "$status_dir/hci-ready.v1"
+}
+
+init_paths
+validate_inputs
+
+if ! read_hci; then
+	# The first kernel probe happens before the p7 overlay is mounted.  Rebind
+	# only this exact serdev child after the verified firmware becomes visible.
+	printf '%s' "$SERIAL_DEVICE" >"$driver/unbind"
+	/usr/bin/sleep 0.05
+	printf '%s' "$SERIAL_DEVICE" >"$driver/bind"
+	wait_transport_ready || die firmware-reprobe-timeout
+fi
+
+$hciconfig hci0 up >/dev/null 2>&1 || die adapter-up-command
+wait_adapter_up || die adapter-up-timeout
+publish_ready
+printf 'BLUETOOTH_HCI_READY result=PASS address=%s driver=%s device=%s\n' \
+	"$HCI_ADDRESS" "$DRIVER_NAME" "$SERIAL_DEVICE"

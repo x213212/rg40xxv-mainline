@@ -20,9 +20,6 @@ ICONS = [
     ("play_arrow", 0xE037),
     ("tune", 0xE429),
     ("power_settings_new", 0xF8C7),
-    # Material Symbols "bluetooth".  Added 2026-08-27 with the Bluetooth page;
-    # before this the page borrowed the cast glyph as a stand-in.
-    ("bluetooth", 0xE1A7),
 ]
 CELL = 32
 

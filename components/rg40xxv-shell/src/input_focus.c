@@ -56,8 +56,10 @@ struct ui_focus_result ui_focus_resolve(enum ui_focus_region region,
 		result.region = UI_FOCUS_TOP_NAV;
 		break;
 	case UI_FOCUS_KEY_SHOULDER_PREVIOUS:
+		result.intent = UI_FOCUS_INTENT_PREVIOUS_TAB;
+		break;
 	case UI_FOCUS_KEY_SHOULDER_NEXT:
-		/* Shoulder navigation is top-level only. */
+		result.intent = UI_FOCUS_INTENT_NEXT_TAB;
 		break;
 	}
 	return result;

@@ -46,7 +46,11 @@ static void test_content_back_and_home_policy(void)
 	result = ui_focus_resolve(UI_FOCUS_CONTENT,
 		UI_FOCUS_KEY_SHOULDER_NEXT, 5, 1, true);
 	assert(result.region == UI_FOCUS_CONTENT);
-	assert(result.intent == UI_FOCUS_INTENT_NONE);
+	assert(result.intent == UI_FOCUS_INTENT_NEXT_TAB);
+	result = ui_focus_resolve(UI_FOCUS_CONTENT,
+		UI_FOCUS_KEY_SHOULDER_PREVIOUS, 5, 1, true);
+	assert(result.region == UI_FOCUS_CONTENT);
+	assert(result.intent == UI_FOCUS_INTENT_PREVIOUS_TAB);
 	result = ui_focus_resolve(UI_FOCUS_CONTENT, UI_FOCUS_KEY_BACK,
 		5, 1, true);
 	assert(result.region == UI_FOCUS_TOP_NAV);
@@ -66,6 +70,6 @@ int main(void)
 {
 	test_top_navigation_isolated_from_content();
 	test_content_back_and_home_policy();
-	puts("INPUT_FOCUS_TEST PASS top-nav/content/back hierarchy");
+	puts("INPUT_FOCUS_TEST PASS top-nav/content/back shoulders=L1/R1");
 	return 0;
 }

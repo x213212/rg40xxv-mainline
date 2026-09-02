@@ -24,10 +24,14 @@ on the card at runtime; it ships with no content.
 
 ## Excluded: proprietary blobs and third-party runtimes
 
-The working tree contained `linux-firmware`, a Cobalt runtime and an NW.js
-build. All are obtainable from their own projects under their own terms, none is
-this project's to relicense, and none is needed to build the kernel. They are
-referenced in `docs/upstream-sources.md` instead.
+The working tree contained `linux-firmware`, a Cobalt runtime, an NW.js build
+and a pinned `yt-dlp`. All are obtainable from their own projects under their own
+terms, none is this project's to relicense, and none is needed to build the
+kernel. They are referenced in `docs/upstream-sources.md` instead.
+
+`components/youtube` needs the `yt-dlp` one at build time, so it ships the
+pinned version, that release's official SHA-256, and `vendor/fetch-yt-dlp.sh`,
+which downloads it and verifies the digest before `build.sh` will use it.
 
 ## Excluded: build output and card dumps
 
@@ -83,6 +87,14 @@ put your own card's GUID in.** That is the guard working as intended, not a bug.
 
 A personal Windows path in one PowerShell helper was parameterised for the same
 reason.
+
+The p7 deployment and acceptance scripts talk to a handheld over SSH. Their
+address and password were one particular device on one particular home network,
+so both now come from `RG40XXV_DEVICE` and `RG40XXV_PASSWORD` and the scripts
+exit 2 until you set them. `components/rg40xxv-shell/tests/test-stream-ui.sh`
+asserted that a specific Sunshine host never reached the streaming source; it
+now rejects *any* address literal that is not a protocol constant, which is both
+a stronger check and one that names nobody.
 
 ## Kept: a test that looks like a leak
 

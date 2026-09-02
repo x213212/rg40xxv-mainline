@@ -12,6 +12,7 @@ static void check_valid(const struct hardware_snapshot *snapshot)
 	assert(snapshot->datetime.local.tm_mday == 25);
 	assert(snapshot->datetime.local.tm_hour == 12);
 	assert(snapshot->datetime.local.tm_min == 34);
+	assert(snapshot->datetime.time_synced == 1);
 	assert(strcmp(snapshot->system.kernel_release,
 		      "7.2.0-rg40xxv-fixture") == 0);
 	assert(snapshot->memory.total_bytes == 1048576000);
@@ -31,6 +32,12 @@ static void check_valid(const struct hardware_snapshot *snapshot)
 	       HARDWARE_VOLTAGE_MEASURED_REGULATOR);
 }
 
+static void check_persistent_sync(const struct hardware_snapshot *snapshot)
+{
+	assert(snapshot->datetime.available == 1);
+	assert(snapshot->datetime.time_synced == 1);
+}
+
 static void check_hwmon(const struct hardware_snapshot *snapshot)
 {
 	assert(snapshot->cpu.voltage_uv == 905000);
@@ -40,6 +47,7 @@ static void check_hwmon(const struct hardware_snapshot *snapshot)
 static void check_unavailable(const struct hardware_snapshot *snapshot)
 {
 	assert(snapshot->datetime.available == -1);
+	assert(snapshot->datetime.time_synced == -1);
 	assert(strcmp(snapshot->system.kernel_release,
 		      HARDWARE_TEXT_UNAVAILABLE) == 0);
 	assert(snapshot->memory.total_bytes == -1);
@@ -50,6 +58,12 @@ static void check_unavailable(const struct hardware_snapshot *snapshot)
 	/* A debugfs OPP target must never be presented as measured voltage. */
 	assert(snapshot->cpu.voltage_uv == -1);
 	assert(snapshot->cpu.voltage_source == HARDWARE_VOLTAGE_UNAVAILABLE);
+}
+
+static void check_unsynced(const struct hardware_snapshot *snapshot)
+{
+	assert(snapshot->datetime.available == 1);
+	assert(snapshot->datetime.time_synced == -1);
 }
 
 int main(int argc, char **argv)
@@ -67,8 +81,12 @@ int main(int argc, char **argv)
 		check_valid(&snapshot);
 	else if (strcmp(argv[2], "hwmon") == 0)
 		check_hwmon(&snapshot);
-	else
+	else if (strcmp(argv[2], "unavailable") == 0)
 		check_unavailable(&snapshot);
+	else if (strcmp(argv[2], "persistent-sync") == 0)
+		check_persistent_sync(&snapshot);
+	else
+		check_unsynced(&snapshot);
 	puts("HARDWARE_FIXTURE_TEST PASS");
 	return 0;
 }

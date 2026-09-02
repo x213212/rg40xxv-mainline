@@ -64,7 +64,8 @@ static void launch_result_message(struct ui *ui, uint32_t now)
 }
 
 void launch_configure(struct ui *ui, const char *executable,
-		      const char *log_path, const char *font_path, bool windowed)
+		      const char *log_path, const char *handoff_path,
+		      const char *font_path, bool windowed)
 {
 	struct launch_state *launch = &ui->launch;
 
@@ -76,6 +77,9 @@ void launch_configure(struct ui *ui, const char *executable,
 		       executable);
 	(void)snprintf(launch->log_path, sizeof(launch->log_path), "%s",
 		       log_path);
+	if (handoff_path != NULL)
+		(void)snprintf(launch->handoff_path,
+			sizeof(launch->handoff_path), "%s", handoff_path);
 	(void)snprintf(launch->font_path, sizeof(launch->font_path), "%s",
 		       font_path);
 }
@@ -91,7 +95,10 @@ void launch_queue_selected(struct ui *ui, uint32_t now)
 		return;
 	game_id = catalog_visible_id(ui, ui->game_index);
 	game = game_id == SIZE_MAX ? NULL : &ui->catalog.games[game_id];
-	if (game == NULL || !game->playable) {
+	/* Runtime admission is resolved before the catalog is built.  Never use a
+	 * launch attempt as a capability probe: it tears down the UI only to return
+	 * an expected status=4 when the MV/MZ compositor/runtime is unavailable. */
+	if (!catalog_game_can_launch(game)) {
 		render_activate(ui, tr(ui, "not_playable"), now);
 		return;
 	}
@@ -143,8 +150,10 @@ int launch_queue_stream(struct ui *ui, const NsHost *host, uint32_t now)
 	request = (struct stream_launcher_request) {
 		.executable = ui->streaming.launcher_path,
 		.host = host->address,
-		.width = host->resolution.width,
-		.height = host->resolution.height,
+		/* The panel is 640x480.  Keep transport settings host-specific, but
+		 * never let a stale 720p host profile increase decode/scaling work. */
+		.width = 640U,
+		.height = 480U,
 		.fps = host->fps,
 		.bitrate_kbps = host->bitrate_kbps,
 		.codec = codec,
@@ -155,6 +164,9 @@ int launch_queue_stream(struct ui *ui, const NsHost *host, uint32_t now)
 	if (error != 0)
 		return error;
 	ui->launch.pending_stream_host = *host;
+	ui->launch.pending_stream_host.resolution.width = 640U;
+	ui->launch.pending_stream_host.resolution.height = 480U;
+	ui->launch.pending_stream_host.resolution.custom = 0;
 	ui->launch.pending_game_id = SIZE_MAX;
 	ui->launch.last_error = 0;
 	ui->launch.transition_detail[0] = '\0';
@@ -175,6 +187,29 @@ int launch_queue_stream(struct ui *ui, const NsHost *host, uint32_t now)
 	return 0;
 }
 
+bool launch_cancel_pending(struct ui *ui, uint32_t now)
+{
+	struct launch_state *launch = &ui->launch;
+
+	/* A resident launch becomes supervisor-owned immediately after the first
+	 * presented transition frame.  Cancellation is truthful only while the
+	 * request is still local and no child/session teardown has started. */
+	if (!launch->pending || launch->process.active ||
+	    launch->session_suspended || launch->supervisor_handoff)
+		return false;
+	launch->pending = false;
+	launch->pending_game_id = SIZE_MAX;
+	launch->transition = LAUNCH_TRANSITION_NONE;
+	launch->transition_presented = false;
+	launch->kind = LAUNCH_KIND_NONE;
+	launch->transition_detail[0] = '\0';
+	launch->diagnostics[0] = '\0';
+	render_activate(ui, tr(ui, "launch_cancelled"), now);
+	(void)fprintf(stderr, "UI_LAUNCH_CANCEL result=cancelled-before-handoff\n");
+	(void)fflush(stderr);
+	return true;
+}
+
 static void begin_pending_launch(struct ui *ui)
 {
 	int error;
@@ -193,6 +228,33 @@ static void begin_pending_launch(struct ui *ui)
 	ui->launch.pending = false;
 	ui->launch.transition = LAUNCH_TRANSITION_NONE;
 	ui->launch.transition_presented = false;
+	if (ui->launch.kind == LAUNCH_KIND_GAME && ui->resident) {
+		struct game_entry *game =
+			&ui->catalog.games[ui->launch.pending_game_id];
+		struct launcher_request request = {
+			.executable = ui->launch.executable,
+			.route = selected_route(game),
+			.platform = game->system,
+			.content = game->path,
+			.log_path = ui->launch.log_path,
+		};
+
+		error = launcher_handoff_write(ui->launch.handoff_path, &request);
+		if (error != 0) {
+			ui->launch.last_error = error;
+			launch_result_message(ui, SDL_GetTicks());
+			return;
+		}
+		history_mark_launched(ui, ui->launch.pending_game_id);
+		persistence_request_history(ui);
+		ui->launch.supervisor_handoff = true;
+		ui->running = false;
+		(void)fprintf(stderr,
+			"UI_LAUNCH_HANDOFF REQUEST_READY platform=%s id=%zu\n",
+			game->system, ui->launch.pending_game_id);
+		(void)fflush(stderr);
+		return;
+	}
 	lifecycle_session_suspend(ui);
 	if (ui->launch.kind == LAUNCH_KIND_STREAM) {
 		const NsHost *host = &ui->launch.pending_stream_host;

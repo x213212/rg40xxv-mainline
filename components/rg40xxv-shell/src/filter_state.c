@@ -32,13 +32,14 @@ void filter_state_load(struct ui *ui, const char *path)
 		else if (strncmp(line, "core=", 5) == 0)
 			ui->catalog.core_filter = named_filter(ui->catalog.cores,
 				ui->catalog.core_count, line + 5);
-		else if (strcmp(line, "favorites=1") == 0)
-			ui->catalog.favorites_only = true;
-		else if (strcmp(line, "recent=1") == 0)
-			ui->catalog.recent_only = true;
+		/* Favorites and recent are navigation pages, not durable library
+		 * filters.  Restoring either bit on the Library page made valid ROMs
+		 * appear to have disappeared after a reboot. */
 		else if (strcmp(line, "search_scope=all") == 0)
 			ui->catalog.search_all_systems = true;
 	}
 	fclose(stream);
+	ui->catalog.favorites_only = false;
+	ui->catalog.recent_only = false;
 	catalog_apply_filters(ui);
 }

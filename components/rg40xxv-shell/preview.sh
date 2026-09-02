@@ -2,7 +2,7 @@
 set -eu
 
 project=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-workspace=$(CDPATH= cd -- "$project/../.." && pwd -P)
+workspace=${RG40XXV_WORKSPACE:-$(CDPATH= cd -- "$project/../../../.." && pwd -P)}
 rootfs="$workspace/firmware/mnt/rootfs"
 font=${RG40XXV_UI_PREVIEW_FONT:-"$project/assets/RG40XXV-UI-Sans.otf"}
 output=${1:-"$project/build/rg40xxv-shell-preview.bmp"}

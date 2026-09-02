@@ -40,11 +40,15 @@ void power_state_init(struct power_state *state, bool lock_enabled);
 unsigned int power_set_lock_enabled(struct power_state *state, bool enabled);
 unsigned int power_button_press(struct power_state *state, uint32_t now);
 unsigned int power_button_release(struct power_state *state, uint32_t now);
+unsigned int power_auto_screen_off(struct power_state *state);
 unsigned int power_update(struct power_state *state, uint32_t now);
 unsigned int power_lock_key(struct power_state *state, int key,
 			    bool eligible, uint32_t now);
 unsigned int power_cancel_shutdown(struct power_state *state);
 bool power_should_render(const struct power_state *state);
 int power_next_timeout_ms(const struct power_state *state, uint32_t now);
+int power_idle_timeout_ms(const struct power_state *state,
+			  uint32_t last_activity, uint32_t idle_ms,
+			  uint32_t now);
 
 #endif

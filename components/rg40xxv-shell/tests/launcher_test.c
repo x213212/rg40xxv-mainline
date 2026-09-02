@@ -27,6 +27,7 @@ int main(int argc, char **argv)
 {
 	struct launcher_process process = { 0 };
 	struct launcher_request request;
+	struct stream_launcher_request stream_request;
 
 	assert(argc == 5);
 	request = (struct launcher_request) {
@@ -50,6 +51,23 @@ int main(int argc, char **argv)
 	request.platform = "--list-platforms";
 	assert(launcher_request_validate(&request) == EINVAL);
 	request.platform = "GBA";
+	stream_request = (struct stream_launcher_request) {
+		.executable = argv[1],
+		.host = "sunshine.local",
+		.width = 640U,
+		.height = 480U,
+		.fps = 60U,
+		.bitrate_kbps = 5000U,
+		.codec = "h264",
+		.aspect = "fit",
+		.log_path = argv[3],
+	};
+	assert(stream_launcher_request_validate(&stream_request) == 0);
+	stream_request.width = 1280U;
+	stream_request.height = 720U;
+	assert(stream_launcher_request_validate(&stream_request) == EINVAL);
+	stream_request.width = 640U;
+	stream_request.height = 480U;
 
 	assert(unsetenv("FAKE_EXIT") == 0);
 	assert(setenv("FAKE_SLEEP", "1", 1) == 0);

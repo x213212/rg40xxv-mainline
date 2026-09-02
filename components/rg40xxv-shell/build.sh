@@ -2,7 +2,11 @@
 set -eu
 
 project=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-workspace=$(CDPATH= cd -- "$project/../.." && pwd -P)
+workspace=${RG40XXV_WORKSPACE:-$(CDPATH= cd -- "$project/../../../.." && pwd -P)}
+case $workspace in
+	/*) ;;
+	*) printf '%s\n' 'RG40XXV_WORKSPACE must be an absolute path' >&2; exit 2 ;;
+esac
 rootfs="$workspace/firmware/mnt/rootfs"
 out="$project/build"
 cc=${CC:-aarch64-linux-gnu-gcc-12}
@@ -33,6 +37,13 @@ mkdir -p "$out"
 	-o "$out/rg40xxv-shell"
 
 aarch64-linux-gnu-strip --strip-unneeded "$out/rg40xxv-shell"
+install -d -m 0755 "$out/release-root/bin" "$out/release-root/share"
+install -m 0755 "$out/rg40xxv-shell" \
+	"$out/release-root/bin/rg40xxv-shell"
+install -m 0644 "$project/assets/RG40XXV-UI-Sans.otf" \
+	"$out/release-root/share/RG40XXV-UI-Sans.otf"
+install -m 0644 "$project/assets/RG40XXV-Material-Icons.png" \
+	"$out/release-root/share/RG40XXV-Material-Icons.png"
 file "$out/rg40xxv-shell"
 aarch64-linux-gnu-readelf -d "$out/rg40xxv-shell" |
 	sed -n '/NEEDED/p'

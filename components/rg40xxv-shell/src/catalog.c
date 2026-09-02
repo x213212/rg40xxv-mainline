@@ -6,6 +6,29 @@
 #include <string.h>
 #include <strings.h>
 
+bool catalog_system_is_rpg(const char *system)
+{
+	return system != NULL &&
+		(strcasecmp(system, "EASYRPG") == 0 ||
+		 strcasecmp(system, "RPGMV") == 0 ||
+		 strcasecmp(system, "RPGMZ") == 0);
+}
+
+bool catalog_system_is_pending_rpg(const char *system)
+{
+	return system != NULL &&
+		(strcasecmp(system, "RPGMV") == 0 ||
+		 strcasecmp(system, "RPGMZ") == 0);
+}
+
+bool catalog_game_can_launch(const struct game_entry *game)
+{
+	/* A catalog tile is not an admission mechanism.  In particular, MV/MZ
+	 * content must stay visible for inventory/cover/translation management but
+	 * cannot launch until its runtime route has passed every device gate. */
+	return game != NULL && game->playable;
+}
+
 static bool contains_text(const char *text, const char *query)
 {
 	size_t query_length;
@@ -33,11 +56,16 @@ static bool game_is_visible(const struct catalog_state *catalog,
 {
 	if (catalog->apps_only)
 		return strcasecmp(game->system, "APPS") == 0;
-	if (catalog->system_filter > 0 &&
+	/* Native applications have their own page and must not leak into games. */
+	if (strcasecmp(game->system, "APPS") == 0)
+		return false;
+	if (catalog->rpg_only && !catalog_system_is_rpg(game->system))
+		return false;
+	if (!catalog->rpg_only && catalog->system_filter > 0 &&
 	    !(catalog->search_all_systems && catalog->query[0] != '\0') &&
 	    strcmp(game->system, catalog->systems[catalog->system_filter - 1]) != 0)
 		return false;
-	if (catalog->core_filter > 0 &&
+	if (!catalog->rpg_only && catalog->core_filter > 0 &&
 	    strcmp(game->core, catalog->cores[catalog->core_filter - 1]) != 0)
 		return false;
 	if (catalog->favorites_only && !game->favorite)
@@ -106,15 +134,32 @@ static void sort_visible_recent(struct catalog_state *catalog)
 
 void catalog_set_apps_view(struct ui *ui, bool enabled)
 {
-	if (ui->catalog.apps_only == enabled)
+	if (ui->catalog.apps_only == enabled &&
+	    (!enabled || !ui->catalog.rpg_only))
 		return;
 	ui->catalog.apps_only = enabled;
+	if (enabled)
+		ui->catalog.rpg_only = false;
+	catalog_apply_filters(ui);
+}
+
+void catalog_set_rpg_view(struct ui *ui, bool enabled)
+{
+	if (ui->catalog.rpg_only == enabled &&
+	    (!enabled || !ui->catalog.apps_only))
+		return;
+	ui->catalog.rpg_only = enabled;
+	if (enabled)
+		ui->catalog.apps_only = false;
 	catalog_apply_filters(ui);
 }
 
 void catalog_apply_filters(struct ui *ui)
 {
 	struct catalog_state *catalog = &ui->catalog;
+	size_t selected_game_id = catalog_visible_id(ui, ui->game_index);
+	size_t selected_visible_index = 0;
+	bool selected_still_visible = false;
 
 	clamp_filter_indices(catalog);
 	if (catalog->visible_capacity < catalog->game_count) {
@@ -130,15 +175,34 @@ void catalog_apply_filters(struct ui *ui)
 	}
 	catalog->visible_count = 0;
 	for (size_t i = 0; i < catalog->game_count; ++i) {
-		if (game_is_visible(catalog, &catalog->games[i]))
+		if (game_is_visible(catalog, &catalog->games[i])) {
+			if (i == selected_game_id) {
+				selected_visible_index = catalog->visible_count;
+				selected_still_visible = true;
+			}
 			catalog->visible[catalog->visible_count++] = i;
+		}
 	}
 	if (catalog->recent_only)
 		sort_visible_recent(catalog);
-	ui->game_index = 0;
-	ui->carousel_position = 0.0;
-	ui->carousel_from = 0.0;
-	ui->carousel_target = 0.0;
+	/* Re-applying the same view is a data refresh, not navigation.  Keep the
+	 * selected item stable so delayed catalog/YouTube updates cannot silently
+	 * snap Apps back to entry zero (PortMaster).  A sorted Recent view needs a
+	 * second lookup because sorting changes the visible position. */
+	if (selected_still_visible && catalog->recent_only) {
+		selected_still_visible = false;
+		for (size_t i = 0; i < catalog->visible_count; ++i) {
+			if (catalog->visible[i] == selected_game_id) {
+				selected_visible_index = i;
+				selected_still_visible = true;
+				break;
+			}
+		}
+	}
+	ui->game_index = selected_still_visible ? selected_visible_index : 0;
+	ui->carousel_position = (double)ui->game_index;
+	ui->carousel_from = (double)ui->game_index;
+	ui->carousel_target = (double)ui->game_index;
 	ui->carousel_started = SDL_GetTicks();
 }
 
@@ -238,7 +302,24 @@ void catalog_filter_text(const struct ui *ui, int filter, char *buffer,
 			catalog->cores[catalog->core_filter - 1]);
 		break;
 	case 4:
-		(void)snprintf(buffer, size, "%s", tr(ui, "filter_reset"));
+		if (catalog->rpg_only) {
+			const struct game_entry *game =
+				catalog_visible_game(ui, ui->game_index);
+
+			if (game == NULL || !catalog_system_is_rpg(game->system))
+				(void)snprintf(buffer, size, "%s",
+					tr(ui, "rpg_translation_unavailable"));
+			else if (strcasecmp(game->system, "EASYRPG") == 0)
+				(void)snprintf(buffer, size, "%s",
+					tr(ui, "rpg_translation_rm2k_hook"));
+			else
+				(void)snprintf(buffer, size, "%s  %s",
+					tr(ui, "rpg_translation"),
+					tr(ui, ui->rpg_translation.mode ==
+						RPG_TRANSLATION_STATIC ?
+						"rpg_translation_static" : "off"));
+		} else
+			(void)snprintf(buffer, size, "%s", tr(ui, "filter_reset"));
 		break;
 	default:
 		(void)snprintf(buffer, size, "%s　%s", tr(ui, "filter_language"),

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015"
+      xmlns="http://www.w3.org/2005/Atom">
+  <id>yt:channel:UC2j5Kw9qDWCZmU_emgqeguA</id>
+  <yt:channelId>UC2j5Kw9qDWCZmU_emgqeguA</yt:channelId>
+  <title>Atom 測試頻道</title>
+  <author><name>Atom 測試頻道</name></author>
+  <entry>
+    <id>yt:video:AtomDate001</id>
+    <yt:videoId>AtomDate001</yt:videoId>
+    <yt:channelId>UC2j5Kw9qDWCZmU_emgqeguA</yt:channelId>
+    <title>最新影片</title>
+    <author><name>Atom 測試頻道</name></author>
+    <published>2026-08-30T23:30:00+00:00</published>
+    <updated>2026-08-30T23:31:00+00:00</updated>
+  </entry>
+  <entry>
+    <id>yt:video:AtomDate002</id>
+    <yt:videoId>AtomDate002</yt:videoId>
+    <yt:channelId>UC2j5Kw9qDWCZmU_emgqeguA</yt:channelId>
+    <title>第二支影片</title>
+    <author><name>Atom 測試頻道</name></author>
+    <published>2026-08-29T12:00:01Z</published>
+    <updated>2026-08-29T12:00:02Z</updated>
+  </entry>
+  <entry>
+    <id>yt:video:AtomDate003</id>
+    <yt:videoId>AtomDate003</yt:videoId>
+    <yt:channelId>UC2j5Kw9qDWCZmU_emgqeguA</yt:channelId>
+    <title>第三支影片</title>
+    <author><name>Atom 測試頻道</name></author>
+    <published>2026-08-28T01:02:03.456Z</published>
+    <updated>2026-08-28T01:02:04.456Z</updated>
+  </entry>
+</feed>

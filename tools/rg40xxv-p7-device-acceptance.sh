@@ -8,8 +8,18 @@ set -euo pipefail
 
 workspace=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 mode=${1:-snapshot}
-device=${RG40XXV_DEVICE:-root@192.168.0.125}
-password=${RG40XXV_PASSWORD:-root}
+device=${RG40XXV_DEVICE:-PUT-YOUR-OWN-DEVICE-HERE}
+password=${RG40XXV_PASSWORD:-}
+
+# These scripts talk to a handheld over SSH. The address and the password are
+# whoever is running them, so there is no useful default: set RG40XXV_DEVICE and
+# RG40XXV_PASSWORD. The refusal below is the guard working, not a bug.
+case "$device" in
+PUT-YOUR-OWN-DEVICE-HERE)
+	printf '%s\n' 'set RG40XXV_DEVICE=user@host for your own device' >&2
+	exit 2 ;;
+esac
+[ -n "$password" ] || { printf '%s\n' 'set RG40XXV_PASSWORD' >&2; exit 2; }
 known_hosts=${RG40XXV_KNOWN_HOSTS:-$workspace/firmware/live/known_hosts}
 expected_p8=${RG40XXV_EXPECTED_P8_SHA256:-6455c4d82d1594c03ab4f799c276da7249c6ffefd6fa22dd55b9077b1dfd4be3}
 expected_release=${RG40XXV_EXPECTED_RELEASE_ID:-}

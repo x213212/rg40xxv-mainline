@@ -7,6 +7,9 @@
 #include <string.h>
 #include <time.h>
 
+_Static_assert((int)NAV_COUNT == (int)UI_LAYOUT_NAV_COUNT,
+	       "navigation model/layout count mismatch");
+
 void render_set_color(SDL_Renderer *renderer, SDL_Color color)
 {
 	(void)SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
@@ -31,8 +34,11 @@ void render_outline_rect(SDL_Renderer *renderer, int x, int y, int w, int h,
 }
 
 void render_fill_round_rect(SDL_Renderer *renderer, int x, int y, int w, int h,
-			    int radius, SDL_Color color)
+				    int radius, SDL_Color color)
 {
+	SDL_Rect rows[UI_HEIGHT];
+	int row_count = 0;
+
 	if (w <= 0 || h <= 0)
 		return;
 	if (radius < 1) {
@@ -43,6 +49,8 @@ void render_fill_round_rect(SDL_Renderer *renderer, int x, int y, int w, int h,
 		radius = w / 2;
 	if (radius * 2 > h)
 		radius = h / 2;
+	if (radius > UI_HEIGHT / 2)
+		radius = UI_HEIGHT / 2;
 	render_set_color(renderer, color);
 	{
 		SDL_Rect middle = { x, y + radius, w, h - radius * 2 };
@@ -58,15 +66,20 @@ void render_fill_round_rect(SDL_Renderer *renderer, int x, int y, int w, int h,
 		int left = x + inset;
 		int right = x + w - inset - 1;
 
-		(void)SDL_RenderDrawLine(renderer, left, y + row, right, y + row);
-		(void)SDL_RenderDrawLine(renderer, left, y + h - row - 1,
-			right, y + h - row - 1);
+		rows[row_count++] = (SDL_Rect){ left, y + row, right - left + 1, 1 };
+		rows[row_count++] = (SDL_Rect){ left, y + h - row - 1,
+			right - left + 1, 1 };
 	}
+	if (row_count > 0)
+		(void)SDL_RenderFillRects(renderer, rows, row_count);
 }
 
 void render_outline_round_rect(SDL_Renderer *renderer, int x, int y, int w,
-			       int h, int radius, SDL_Color color)
+				       int h, int radius, SDL_Color color)
 {
+	SDL_Point arc_points[4U * 31U];
+	int point_count = 0;
+
 	if (radius < 1) {
 		render_outline_rect(renderer, x, y, w, h, color);
 		return;
@@ -87,15 +100,16 @@ void render_outline_round_rect(SDL_Renderer *renderer, int x, int y, int w,
 		int dx = (int)lrint(cos(angle) * (radius - 1));
 		int dy = (int)lrint(sin(angle) * (radius - 1));
 
-		(void)SDL_RenderDrawPoint(renderer, x + radius - 1 - dx,
-			y + radius - 1 - dy);
-		(void)SDL_RenderDrawPoint(renderer, x + w - radius + dx,
-			y + radius - 1 - dy);
-		(void)SDL_RenderDrawPoint(renderer, x + radius - 1 - dx,
-			y + h - radius + dy);
-		(void)SDL_RenderDrawPoint(renderer, x + w - radius + dx,
-			y + h - radius + dy);
+		arc_points[point_count++] = (SDL_Point){ x + radius - 1 - dx,
+			y + radius - 1 - dy };
+		arc_points[point_count++] = (SDL_Point){ x + w - radius + dx,
+			y + radius - 1 - dy };
+		arc_points[point_count++] = (SDL_Point){ x + radius - 1 - dx,
+			y + h - radius + dy };
+		arc_points[point_count++] = (SDL_Point){ x + w - radius + dx,
+			y + h - radius + dy };
 	}
+	(void)SDL_RenderDrawPoints(renderer, arc_points, point_count);
 }
 
 void render_glass_panel(SDL_Renderer *renderer, int x, int y, int w, int h,
@@ -118,13 +132,19 @@ void render_glass_panel(SDL_Renderer *renderer, int x, int y, int w, int h,
 		(SDL_Color){ 220, 220, 220, 24 });
 }
 
+bool render_set_opaque_cache_blend(SDL_Texture *texture)
+{
+	return texture != NULL &&
+		SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_NONE) == 0;
+}
+
 static uint8_t mix_channel(unsigned int first, unsigned int second,
 			   unsigned int amount, unsigned int scale)
 {
 	return (uint8_t)((first * (scale - amount) + second * amount) / scale);
 }
 
-void render_backdrop(struct ui *ui)
+static void draw_backdrop_contents(struct ui *ui)
 {
 	const SDL_Color top = { 8, 8, 8, 255 };
 	const SDL_Color middle = { 20, 20, 20, 255 };
@@ -132,6 +152,8 @@ void render_backdrop(struct ui *ui)
 	const int band = 4;
 
 	for (int y = 0; y < UI_LAYOUT_CONTROLS_Y; y += band) {
+		int height = UI_LAYOUT_CONTROLS_Y - y < band ?
+			UI_LAYOUT_CONTROLS_Y - y : band;
 		SDL_Color color;
 		if (y < UI_LAYOUT_CONTROLS_Y / 2) {
 			unsigned int amount = (unsigned int)y;
@@ -154,9 +176,10 @@ void render_backdrop(struct ui *ui)
 				mix_channel(middle.b, bottom.b, amount, scale), 255,
 			};
 		}
-		render_fill_rect(ui->renderer, 0, y, UI_WIDTH, band, color);
+		render_fill_rect(ui->renderer, 0, y, UI_WIDTH, height, color);
 	}
 	if (ui->nav_index <= NAV_PAGE_FAVORITES ||
+	    ui->nav_index == NAV_PAGE_RPG ||
 	    ui->nav_index == NAV_PAGE_APPS) {
 		size_t game_id = catalog_visible_id(ui, ui->game_index);
 		int width = 0;
@@ -180,6 +203,76 @@ void render_backdrop(struct ui *ui)
 	}
 	render_fill_round_rect(ui->renderer, 44, 104, 552, 230, 110,
 		(SDL_Color){ 172, 172, 172, 12 });
+}
+
+void render_backdrop(struct ui *ui)
+{
+	bool cover_backdrop = ui->nav_index <= NAV_PAGE_FAVORITES ||
+		ui->nav_index == NAV_PAGE_RPG || ui->nav_index == NAV_PAGE_APPS;
+
+	/* Library pages blend the selected cover into the background.  The other
+	 * pages share one pixel-identical opaque backdrop, so keep that expensive
+	 * software-rasterized gradient/glow as a renderer-owned static layer. */
+	if (cover_backdrop) {
+		draw_backdrop_contents(ui);
+		return;
+	}
+	if (ui->backdrop_cache == NULL) {
+		SDL_Texture *previous = SDL_GetRenderTarget(ui->renderer);
+		SDL_Texture *target = SDL_CreateTexture(ui->renderer,
+			SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET,
+			UI_WIDTH, UI_HEIGHT);
+
+		if (target != NULL && SDL_SetRenderTarget(ui->renderer, target) == 0) {
+			render_set_color(ui->renderer, (SDL_Color){ 5, 5, 5, 255 });
+			(void)SDL_RenderClear(ui->renderer);
+			draw_backdrop_contents(ui);
+			(void)SDL_SetRenderTarget(ui->renderer, previous);
+			(void)SDL_SetTextureBlendMode(target, SDL_BLENDMODE_NONE);
+			ui->backdrop_cache = target;
+		} else {
+			if (target != NULL)
+				SDL_DestroyTexture(target);
+			(void)SDL_SetRenderTarget(ui->renderer, previous);
+			draw_backdrop_contents(ui);
+			return;
+		}
+	}
+	(void)SDL_RenderCopy(ui->renderer, ui->backdrop_cache, NULL, NULL);
+}
+
+void render_settings_background(struct ui *ui, bool focused)
+{
+	unsigned int index = focused ? 1U : 0U;
+	SDL_Texture *target = ui->settings_background_cache[index];
+
+	if (target == NULL) {
+		SDL_Texture *previous = SDL_GetRenderTarget(ui->renderer);
+
+		target = SDL_CreateTexture(ui->renderer, SDL_PIXELFORMAT_ARGB8888,
+			SDL_TEXTUREACCESS_TARGET, UI_WIDTH, UI_HEIGHT);
+		if (target != NULL && SDL_SetRenderTarget(ui->renderer, target) == 0) {
+			render_set_color(ui->renderer, (SDL_Color){ 5, 5, 5, 255 });
+			(void)SDL_RenderClear(ui->renderer);
+			draw_backdrop_contents(ui);
+			render_glass_panel(ui->renderer, UI_LAYOUT_CONTENT_X,
+				UI_LAYOUT_CONTENT_Y, UI_LAYOUT_CONTENT_WIDTH,
+				UI_LAYOUT_CONTENT_HEIGHT, focused);
+			(void)SDL_SetRenderTarget(ui->renderer, previous);
+			(void)SDL_SetTextureBlendMode(target, SDL_BLENDMODE_NONE);
+			ui->settings_background_cache[index] = target;
+		} else {
+			if (target != NULL)
+				SDL_DestroyTexture(target);
+			(void)SDL_SetRenderTarget(ui->renderer, previous);
+			render_backdrop(ui);
+			render_glass_panel(ui->renderer, UI_LAYOUT_CONTENT_X,
+				UI_LAYOUT_CONTENT_Y, UI_LAYOUT_CONTENT_WIDTH,
+				UI_LAYOUT_CONTENT_HEIGHT, focused);
+			return;
+		}
+	}
+	(void)SDL_RenderCopy(ui->renderer, target, NULL, NULL);
 }
 
 static void draw_wifi_icon(struct ui *ui, int x, int y, int percent)
@@ -258,11 +351,23 @@ void render_status(struct ui *ui)
 		(void)snprintf(volume, sizeof(volume), "%s%d%%",
 			status->audio.muted > 0 ? "M " : "", status->audio.volume_percent);
 	if (status->wifi.operstate != HARDWARE_NETWORK_UP)
+	{
+		ui->clock_sync_waiting = false;
 		sync = tr(ui, "offline");
-	else if (status->datetime.time_synced > 0)
+	}
+	else if (status->datetime.time_synced > 0) {
+		ui->clock_sync_waiting = false;
 		sync = tr(ui, "synced");
-	else
-		sync = tr(ui, "syncing");
+	} else {
+		uint32_t now = SDL_GetTicks();
+
+		if (!ui->clock_sync_waiting) {
+			ui->clock_sync_waiting = true;
+			ui->clock_sync_deadline = now + 30000U;
+		}
+		sync = SDL_TICKS_PASSED(now, ui->clock_sync_deadline) ?
+			tr(ui, "unsynced") : tr(ui, "syncing");
+	}
 	render_fill_round_rect(ui->renderer, 8, 4, UI_WIDTH - 16, 28, 11,
 		(SDL_Color){ 18, 18, 18, 196 });
 	render_outline_round_rect(ui->renderer, 8, 4, UI_WIDTH - 16, 28, 11,
@@ -291,13 +396,13 @@ void render_status(struct ui *ui)
 static void draw_navigation_contents(struct ui *ui)
 {
 	static const char *const nav_keys[NAV_COUNT] = {
-		"nav_recent", "nav_library", "nav_favorites", "nav_streaming",
-		"nav_apps", "nav_network", "nav_settings",
+		"nav_recent", "nav_library", "nav_favorites", "nav_rpg",
+		"nav_streaming", "nav_apps", "nav_network", "nav_settings",
 	};
 	static const enum material_icon_id nav_icons[NAV_COUNT] = {
 		MATERIAL_ICON_HISTORY, MATERIAL_ICON_LIBRARY,
-		MATERIAL_ICON_FAVORITE, MATERIAL_ICON_CAST, MATERIAL_ICON_APPS,
-		MATERIAL_ICON_WIFI, MATERIAL_ICON_SETTINGS,
+		MATERIAL_ICON_FAVORITE, MATERIAL_ICON_PLAY, MATERIAL_ICON_CAST,
+		MATERIAL_ICON_APPS, MATERIAL_ICON_WIFI, MATERIAL_ICON_SETTINGS,
 	};
 	const SDL_Color normal = { 158, 158, 158, 255 };
 	const SDL_Color selected = { 238, 238, 238, 255 };
@@ -315,10 +420,21 @@ static void draw_navigation_contents(struct ui *ui)
 		int icon_size = ui->icon_atlas != NULL ? 18 : 0;
 		int gap = icon_size > 0 ? 3 : 0;
 		int group_width = icon_size + gap + label_width;
-		int group_x = tab.x + (tab.width - group_width) / 2;
-		int label_x = group_x + icon_size + gap;
+		int group_x;
+		int label_x;
 		bool active = i == ui->nav_index;
 		bool focused = active && ui->focus_region == UI_FOCUS_TOP_NAV;
+
+		/* Eight fixed tabs fit at 640 px by dropping the decorative icon
+		 * before clipping a longer localized label.  The tab and text remain
+		 * visible at every catalog count, including an empty RPG catalog. */
+		if (group_width > clip.w) {
+			icon_size = 0;
+			gap = 0;
+			group_width = label_width;
+		}
+		group_x = tab.x + (tab.width - group_width) / 2;
+		label_x = group_x + icon_size + gap;
 
 		if (active) {
 			render_fill_round_rect(ui->renderer, tab.x + 2, tab.y,
@@ -345,14 +461,31 @@ static void draw_navigation_contents(struct ui *ui)
 
 void render_navigation(struct ui *ui, uint32_t now)
 {
+	static int verify_direct = -1;
+	/* The content panel's one-pixel outer highlight starts at
+	 * UI_LAYOUT_CONTENT_Y - 1.  Do not let the retained navigation layer
+	 * overwrite that pixel after the content page has already been drawn. */
 	SDL_Rect section = { 0, UI_LAYOUT_STATUS_BOTTOM, UI_WIDTH,
-		UI_LAYOUT_CONTENT_Y - UI_LAYOUT_STATUS_BOTTOM };
+		UI_LAYOUT_CONTENT_Y - UI_LAYOUT_STATUS_BOTTOM - 1 };
+	bool cover_backdrop = ui->nav_index <= NAV_PAGE_FAVORITES ||
+		ui->nav_index == NAV_PAGE_RPG || ui->nav_index == NAV_PAGE_APPS;
 	bool current = ui->navigation_cache != NULL &&
 		ui->navigation_cache_index == ui->nav_index &&
 		ui->navigation_cache_focus_region == ui->focus_region &&
 		ui->navigation_cache_language == ui->locale.language;
 
 	(void)now;
+	if (verify_direct < 0)
+		verify_direct = getenv("RG40XXV_TEST_DIRECT_COMPOSITE") != NULL;
+	if (verify_direct) {
+		draw_navigation_contents(ui);
+		return;
+	}
+	/* A selected cover changes the pixels under this translucent panel. */
+	if (cover_backdrop) {
+		draw_navigation_contents(ui);
+		return;
+	}
 	if (!current && ui->metrics.input_counter != 0U) {
 		draw_navigation_contents(ui);
 		return;
@@ -368,11 +501,16 @@ void render_navigation(struct ui *ui, uint32_t now)
 			draw_navigation_contents(ui);
 			return;
 		}
-		render_set_color(ui->renderer, (SDL_Color){ 0, 0, 0, 0 });
+		render_set_color(ui->renderer, (SDL_Color){ 5, 5, 5, 255 });
 		(void)SDL_RenderClear(ui->renderer);
+		render_backdrop(ui);
 		draw_navigation_contents(ui);
 		(void)SDL_SetRenderTarget(ui->renderer, NULL);
-		(void)SDL_SetTextureBlendMode(target, SDL_BLENDMODE_BLEND);
+		if (!render_set_opaque_cache_blend(target)) {
+			SDL_DestroyTexture(target);
+			draw_navigation_contents(ui);
+			return;
+		}
 		if (ui->navigation_cache != NULL)
 			SDL_DestroyTexture(ui->navigation_cache);
 		ui->navigation_cache = target;
@@ -398,6 +536,36 @@ static void draw_cover_texture(SDL_Renderer *renderer, SDL_Texture *texture,
 		source.y = (source_height - source.h) / 2;
 	}
 	(void)SDL_RenderCopy(renderer, texture, &source, &destination);
+}
+
+static bool is_youtube_application(const struct game_entry *game)
+{
+	return game != NULL && game->system != NULL &&
+		game->system_label != NULL && game->title != NULL &&
+		strcmp(game->system, "APPS") == 0 &&
+		strcmp(game->system_label, "YouTube") == 0 &&
+		strncmp(game->title, "YouTube", strlen("YouTube")) == 0;
+}
+
+static void draw_youtube_application_icon(struct ui *ui, int x, int y,
+					  int w, int h, bool selected)
+{
+	int button_w = w * 3 / 5;
+	int button_h = h * 2 / 7;
+	int button_x = x + (w - button_w) / 2;
+	int button_y = y + (h - button_h) / 2;
+	int icon_size = button_h > 32 ? 32 : button_h - 4;
+
+	render_fill_round_rect(ui->renderer, x + 4, y + 4, w - 8, h - 8,
+		9, (SDL_Color){ 18, 18, 18, 255 });
+	render_fill_round_rect(ui->renderer, button_x, button_y, button_w,
+		button_h, button_h / 4, (SDL_Color){ 255, 0, 0, 255 });
+	if (icon_size > 0)
+		material_icon_draw(ui, MATERIAL_ICON_PLAY,
+			button_x + (button_w - icon_size) / 2,
+			button_y + (button_h - icon_size) / 2,
+			icon_size, (SDL_Color){ 255, 255, 255, 255 }, true,
+			selected);
 }
 
 void render_cover(struct ui *ui, int x, int y, int w, int h,
@@ -435,6 +603,8 @@ void render_cover(struct ui *ui, int x, int y, int w, int h,
 			(void)SDL_SetTextureAlphaMod(texture, 255);
 			(void)SDL_SetTextureColorMod(texture, 255, 255, 255);
 		}
+	} else if (is_youtube_application(game)) {
+		draw_youtube_application_icon(ui, x, y, w, h, selected);
 	} else {
 		uint8_t tone = (uint8_t)(28U + game_id % 5U * 3U);
 		SDL_Rect clip = { x + 4, y + 4, w - 8, h - 8 };

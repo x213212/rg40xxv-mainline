@@ -19,6 +19,7 @@ init_paths() {
     cpufreq_root="${root_prefix}/sys/devices/system/cpu/cpufreq"
     nvmem_root="${root_prefix}/sys/bus/nvmem/devices"
     run_dir="${root_prefix}/run/rg40xxv/cpu-policy"
+    sleep_snapshot="$run_dir/sleep-governors.v1"
 }
 
 discover_policies() {
@@ -51,6 +52,7 @@ read_policy() {
     current=$(<"$policy/scaling_governor")
     frequencies=$(<"$policy/scaling_available_frequencies")
     word_present schedutil "$governors" || return 1
+    word_present powersave "$governors" || return 1
     word_present performance "$governors" || return 1
     word_present "$current" "$governors" || return 1
     for value in $frequencies; do
@@ -91,14 +93,20 @@ validate_all() {
 }
 
 write_governor() {
-    local policy=$1 governor=$2 name
+    local policy=$1 governor=$2 name fail_policy
     name=$(basename -- "$policy")
     [[ -f "$policy/scaling_governor" && ! -L "$policy/scaling_governor" && -w "$policy/scaling_governor" ]] || return 1
-    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 && ${CPU_POLICY_TEST_FAIL_POLICY:-} == "$name" && ${FAIL_USED:-0} == 0 ]]; then
+    if [[ ${RESTORE_PHASE:-0} == 1 ]]; then
+        fail_policy=${CPU_POLICY_TEST_FAIL_RESTORE_POLICY:-}
+    else
+        fail_policy=${CPU_POLICY_TEST_FAIL_POLICY:-}
+    fi
+    if [[ ${DEVICE_CONTROL_TESTING:-0} == 1 && $fail_policy == "$name" && ${FAIL_USED:-0} == 0 ]]; then
         FAIL_USED=1
         return 1
     fi
     printf '%s' "$governor" >"$policy/scaling_governor"
+    [[ $(<"$policy/scaling_governor") == "$governor" ]]
 }
 
 set_all_governors() {
@@ -131,28 +139,136 @@ status_all() {
 }
 
 snapshot_governors() {
-    local policy data current
+    local policy data current related
     SNAPSHOT=$(mktemp "$run_dir/.governors.XXXXXX")
     for policy in "${POLICIES[@]}"; do
         data=$(read_policy "$policy") || return 1
         current=${data%%$'\t'*}
-        printf '%s\t%s\n' "$(basename -- "$policy")" "$current" >>"$SNAPSHOT"
+        related=$(<"$policy/related_cpus")
+        [[ $related =~ ^[0-9]+(\ [0-9]+)*$ ]] || return 1
+        printf '%s\t%s\t%s\n' "$(basename -- "$policy")" "$current" \
+            "$related" >>"$SNAPSHOT"
     done
     chmod 0600 "$SNAPSHOT"
 }
 
-restore_governors() {
-    local name governor policy result=0
-    [[ -f ${SNAPSHOT:-} ]] || return 0
-    CPU_POLICY_TEST_FAIL_POLICY=
-    while IFS=$'\t' read -r name governor; do
-        [[ $name =~ ^policy[0-9]+$ ]] || { result=1; continue; }
+validate_snapshot_file() {
+    local snapshot=$1 name governor related current_related policy data available count=0
+    local -A seen=()
+
+    [[ -f "$snapshot" && ! -L "$snapshot" ]] || return 1
+    discover_policies
+    while IFS=$'\t' read -r name governor related; do
+        [[ $name =~ ^policy[0-9]+$ ]] || return 1
+        [[ $governor =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || return 1
+        [[ $related =~ ^[0-9]+(\ [0-9]+)*$ ]] || return 1
+        [[ -z ${seen[$name]+x} ]] || return 1
+        seen[$name]=1
+        policy="$cpufreq_root/$name"
+        [[ -d "$policy" && ! -L "$policy" ]] || return 1
+        data=$(read_policy "$policy") || return 1
+        [[ -f "$policy/related_cpus" && ! -L "$policy/related_cpus" ]] || return 1
+        current_related=$(<"$policy/related_cpus")
+        [[ $current_related == "$related" ]] || return 1
+        available=${data#*$'\t'}
+        available=${available%%$'\t'*}
+        word_present "$governor" "$available" || return 1
+        count=$((count + 1))
+    done <"$snapshot"
+    ((count > 0)) || return 1
+}
+
+set_snapshot_governors() {
+    local snapshot=$1 governor=$2 name saved related policy data available result=0
+
+    validate_snapshot_file "$snapshot" || return 1
+    FAIL_USED=0
+    RESTORE_PHASE=0
+    while IFS=$'\t' read -r name saved related; do
+        policy="$cpufreq_root/$name"
+        data=$(read_policy "$policy") || { result=1; continue; }
+        available=${data#*$'\t'}
+        available=${available%%$'\t'*}
+        word_present "$governor" "$available" || { result=1; continue; }
+        write_governor "$policy" "$governor" || result=1
+    done <"$snapshot"
+    return "$result"
+}
+
+restore_governors_file() {
+    local snapshot=$1 name governor related policy result=0
+
+    validate_snapshot_file "$snapshot" || return 1
+    FAIL_USED=0
+    RESTORE_PHASE=1
+    while IFS=$'\t' read -r name governor related; do
         policy="$cpufreq_root/$name"
         write_governor "$policy" "$governor" || result=1
-    done <"$SNAPSHOT"
-    rm -f -- "$SNAPSHOT"
-    SNAPSHOT=
+    done <"$snapshot"
+    RESTORE_PHASE=0
     return "$result"
+}
+
+restore_governors() {
+    [[ -f ${SNAPSHOT:-} ]] || return 0
+    if restore_governors_file "$SNAPSHOT"; then
+        rm -f -- "$SNAPSHOT"
+        SNAPSHOT=
+        return 0
+    fi
+    return 1
+}
+
+sleep_enter() {
+    local tmp policy data related
+
+    discover_policies
+    if [[ -e "$sleep_snapshot" || -L "$sleep_snapshot" ]]; then
+        validate_snapshot_file "$sleep_snapshot" ||
+            die '既有 sleep governor 快照損壞'
+    else
+        tmp=$(mktemp "$run_dir/.sleep-governors.XXXXXX")
+        SNAPSHOT=$tmp
+        for policy in "${POLICIES[@]}"; do
+            data=$(read_policy "$policy") || {
+                rm -f -- "$tmp"
+                SNAPSHOT=
+                die "無效 policy：$(basename -- "$policy")"
+            }
+            related=$(<"$policy/related_cpus")
+            [[ $related =~ ^[0-9]+(\ [0-9]+)*$ ]] || {
+                rm -f -- "$tmp"
+                SNAPSHOT=
+                die "policy CPU topology 無效：$(basename -- "$policy")"
+            }
+            printf '%s\t%s\t%s\n' "$(basename -- "$policy")" \
+                "${data%%$'\t'*}" "$related" >>"$tmp"
+        done
+        chmod 0600 "$tmp"
+        mv -f -- "$tmp" "$sleep_snapshot"
+        SNAPSHOT=
+    fi
+    if ! set_snapshot_governors "$sleep_snapshot" powersave; then
+        if restore_governors_file "$sleep_snapshot" >/dev/null 2>&1; then
+            rm -f -- "$sleep_snapshot"
+            die '切換 powersave 失敗，已還原原 governor'
+        fi
+        die '切換 powersave 失敗且無法完整還原；快照已保留'
+    fi
+    printf 'governor=powersave\n'
+}
+
+sleep_exit() {
+    if [[ ! -e "$sleep_snapshot" && ! -L "$sleep_snapshot" ]]; then
+        printf 'governor=unchanged\n'
+        return 0
+    fi
+    if ! restore_governors_file "$sleep_snapshot"; then
+        set_snapshot_governors "$sleep_snapshot" powersave >/dev/null 2>&1 || true
+        die '無法還原 sleep 前 governor；快照已保留'
+    fi
+    rm -f -- "$sleep_snapshot"
+    printf 'governor=restored\n'
 }
 
 run_performance() {
@@ -203,7 +319,10 @@ init_paths
 mkdir -p -- "$run_dir"
 chmod 0700 "$run_dir"
 exec 9>"$run_dir/.lock"
-flock -x 9
+if ! flock -x -w 1 -E 75 9; then
+	printf '%s\n' 'cpu-policyctl: governor policy lock timed out after 1 second' >&2
+	exit 75
+fi
 SNAPSHOT=
 
 case ${1:-} in
@@ -222,8 +341,12 @@ case ${1:-} in
         ;;
     lock-idle)
         (($# == 1)) || die 'lock-idle 不接受額外參數'
-        validate_all >/dev/null
-        printf 'governor=unchanged\nfrequency_cap=unchanged\nruntime_idle=delegated-to-kernel\n'
+        sleep_enter
+        printf 'frequency_cap=unchanged\nruntime_idle=delegated-to-kernel\n'
+        ;;
+    unlock-idle)
+        (($# == 1)) || die 'unlock-idle 不接受額外參數'
+        sleep_exit
         ;;
     run-performance)
         [[ ${2:-} == -- ]] || die '固定語法為 run-performance -- <命令>'
@@ -231,7 +354,7 @@ case ${1:-} in
         run_performance "$@"
         ;;
     *)
-        printf '用法：%s {validate|status|ui-default|lock-idle}\n' "$0" >&2
+        printf '用法：%s {validate|status|ui-default|lock-idle|unlock-idle}\n' "$0" >&2
         printf '      %s run-performance -- <命令與參數...>\n' "$0" >&2
         exit 2
         ;;

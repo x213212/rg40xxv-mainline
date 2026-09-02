@@ -20,6 +20,7 @@
 enum {
 	SETTINGS_WORK_QUEUE = 32,
 	SETTINGS_RESULT_QUEUE = 32,
+	SETTINGS_COALESCED_STATES = 4,
 	HARDWARECTL_TIMEOUT_MS = 5000,
 	HARDWARECTL_TERM_GRACE_MS = 250,
 };
@@ -33,7 +34,11 @@ static char *const hardwarectl_environment[] = {
 
 struct settings_request {
 	enum settings_hardware_command command;
+	uint64_t request_id;
 	int value;
+	int previous_value;
+	char identifier[37];
+	char secret[64];
 };
 
 struct settings_worker {
@@ -46,6 +51,10 @@ struct settings_worker {
 	size_t request_count;
 	size_t result_head;
 	size_t result_count;
+	struct settings_request active_request;
+	bool request_active;
+	int last_applied_value[SETTINGS_COALESCED_STATES];
+	bool last_applied_valid[SETTINGS_COALESCED_STATES];
 	char executable[4096];
 	char log_path[4096];
 	bool stopping;
@@ -147,10 +156,108 @@ static void request_arguments(const struct settings_worker *worker,
 		arguments[1] = (char *)"orderly-shutdown";
 		break;
 	case SETTINGS_HW_REBOOT_CUSTOM:
-		/* The UI never supplies an arbitrary reboot target. */
 		arguments[1] = (char *)"reboot-custom";
 		break;
+	case SETTINGS_HW_NETWORK_STATUS:
+		arguments[1] = (char *)"network-status";
+		break;
+	case SETTINGS_HW_WIFI_RECOVER:
+		arguments[1] = (char *)"network-wifi-recover";
+		break;
+	case SETTINGS_HW_WIFI_SCAN:
+		arguments[1] = (char *)"network-wifi-scan";
+		break;
+	case SETTINGS_HW_WIFI_CONNECT:
+		arguments[1] = (char *)"network-wifi-connect";
+		arguments[2] = (char *)request->identifier;
+		break;
+	case SETTINGS_HW_WIFI_DISCONNECT:
+		arguments[1] = (char *)"network-wifi-disconnect";
+		break;
+	case SETTINGS_HW_WIFI_FORGET:
+		arguments[1] = (char *)"network-wifi-forget";
+		arguments[2] = (char *)request->identifier;
+		break;
+	case SETTINGS_HW_HOTSPOT_SET:
+		arguments[1] = (char *)"network-hotspot";
+		arguments[2] = (char *)(request->value != 0 ? "on" : "off");
+		break;
 	}
+}
+
+static uint64_t request_timeout_ms(enum settings_hardware_command command)
+{
+	switch (command) {
+	case SETTINGS_HW_NETWORK_STATUS:
+		return 5000U;
+	case SETTINGS_HW_WIFI_SCAN:
+		return 20000U;
+	case SETTINGS_HW_WIFI_RECOVER:
+	case SETTINGS_HW_WIFI_CONNECT:
+	case SETTINGS_HW_HOTSPOT_SET:
+		return 30000U;
+	case SETTINGS_HW_WIFI_DISCONNECT:
+	case SETTINGS_HW_WIFI_FORGET:
+		return 15000U;
+	default:
+		return HARDWARECTL_TIMEOUT_MS;
+	}
+}
+
+static void secure_clear(void *memory, size_t size)
+{
+	volatile unsigned char *bytes = memory;
+
+	while (size-- > 0U)
+		*bytes++ = 0U;
+}
+
+static int preload_secret_pipe(const struct settings_request *request,
+			       int pipe_fds[2])
+{
+	size_t length = strlen(request->secret);
+	char payload[65];
+	size_t offset = 0U;
+
+	pipe_fds[0] = -1;
+	pipe_fds[1] = -1;
+	if (request->command != SETTINGS_HW_WIFI_CONNECT)
+		return 0;
+	if (pipe(pipe_fds) != 0)
+		return errno;
+	if (fcntl(pipe_fds[0], F_SETFD, FD_CLOEXEC) != 0 ||
+	    fcntl(pipe_fds[1], F_SETFD, FD_CLOEXEC) != 0) {
+		int error = errno;
+
+		(void)close(pipe_fds[0]);
+		(void)close(pipe_fds[1]);
+		pipe_fds[0] = -1;
+		pipe_fds[1] = -1;
+		return error;
+	}
+	memcpy(payload, request->secret, length);
+	payload[length++] = '\n';
+	while (offset < length) {
+		ssize_t count = write(pipe_fds[1], payload + offset, length - offset);
+
+		if (count < 0 && errno == EINTR)
+			continue;
+		if (count <= 0) {
+			int error = count < 0 ? errno : EIO;
+
+			secure_clear(payload, sizeof(payload));
+			(void)close(pipe_fds[0]);
+			(void)close(pipe_fds[1]);
+			pipe_fds[0] = -1;
+			pipe_fds[1] = -1;
+			return error;
+		}
+		offset += (size_t)count;
+	}
+	secure_clear(payload, sizeof(payload));
+	(void)close(pipe_fds[1]);
+	pipe_fds[1] = -1;
+	return 0;
 }
 
 static struct settings_hardware_result execute_request(
@@ -159,7 +266,9 @@ static struct settings_hardware_result execute_request(
 {
 	struct settings_hardware_result result = {
 		.command = request->command,
+		.request_id = request->request_id,
 		.value = request->value,
+		.previous_value = request->previous_value,
 		.exit_code = -1,
 	};
 	posix_spawn_file_actions_t actions;
@@ -168,6 +277,7 @@ static struct settings_hardware_result execute_request(
 	char *arguments[4];
 	pid_t child = 0;
 	int log_fd = -1;
+	int secret_pipe[2] = { -1, -1 };
 	int status = 0;
 	int error;
 	pid_t waited;
@@ -175,6 +285,9 @@ static struct settings_hardware_result execute_request(
 	struct stat log_status;
 
 	request_arguments(worker, request, value, arguments);
+	error = preload_secret_pipe(request, secret_pipe);
+	if (error != 0)
+		goto done;
 	error = posix_spawn_file_actions_init(&actions);
 	if (error != 0)
 		goto done;
@@ -201,6 +314,11 @@ static struct settings_hardware_result execute_request(
 							 STDERR_FILENO);
 	if (error == 0)
 		error = posix_spawn_file_actions_addclose(&actions, log_fd);
+	if (error == 0 && secret_pipe[0] >= 0)
+		error = posix_spawn_file_actions_adddup2(&actions, secret_pipe[0],
+			STDIN_FILENO);
+	if (error == 0 && secret_pipe[0] >= 0)
+		error = posix_spawn_file_actions_addclose(&actions, secret_pipe[0]);
 	if (error == 0)
 		error = configure_child_signals(&attributes);
 	if (error == 0)
@@ -209,12 +327,17 @@ static struct settings_hardware_result execute_request(
 				    hardwarectl_environment);
 	if (log_fd >= 0)
 		(void)close(log_fd);
+	if (secret_pipe[0] >= 0) {
+		(void)close(secret_pipe[0]);
+		secret_pipe[0] = -1;
+	}
 	(void)posix_spawnattr_destroy(&attributes);
 	(void)posix_spawn_file_actions_destroy(&actions);
 	if (error != 0)
 		goto done;
 	{
-		uint64_t deadline = monotonic_ms() + HARDWARECTL_TIMEOUT_MS;
+		uint64_t deadline = monotonic_ms() +
+			request_timeout_ms(request->command);
 		struct timespec pause = { .tv_sec = 0, .tv_nsec = 10000000L };
 
 		for (;;) {
@@ -271,16 +394,19 @@ static struct settings_hardware_result execute_request(
 	return result;
 
 done:
+	if (secret_pipe[0] >= 0)
+		(void)close(secret_pipe[0]);
+	if (secret_pipe[1] >= 0)
+		(void)close(secret_pipe[1]);
 	result.spawn_error = error;
 	return result;
 }
 
-static void store_result(struct settings_worker *worker,
-			 const struct settings_hardware_result *result)
+static void store_result_locked(struct settings_worker *worker,
+				const struct settings_hardware_result *result)
 {
 	size_t position;
 
-	(void)SDL_LockMutex(worker->mutex);
 	if (worker->result_count == SETTINGS_RESULT_QUEUE) {
 		worker->result_head =
 			(worker->result_head + 1U) % SETTINGS_RESULT_QUEUE;
@@ -290,12 +416,35 @@ static void store_result(struct settings_worker *worker,
 		SETTINGS_RESULT_QUEUE;
 	worker->results[position] = *result;
 	++worker->result_count;
-	(void)SDL_UnlockMutex(worker->mutex);
+}
+
+static void notify_result(void)
+{
 	{
 		SDL_Event event = { .type = SDL_USEREVENT };
 
-		event.user.code = 0x52474857;
+		event.user.code = SETTINGS_WORKER_EVENT_CODE;
 		(void)SDL_PushEvent(&event);
+	}
+}
+
+static void store_result(struct settings_worker *worker,
+			 const struct settings_hardware_result *result)
+{
+	(void)SDL_LockMutex(worker->mutex);
+	store_result_locked(worker, result);
+	(void)SDL_UnlockMutex(worker->mutex);
+	notify_result();
+}
+
+static int coalesced_state_index(enum settings_hardware_command command)
+{
+	switch (command) {
+	case SETTINGS_HW_BRIGHTNESS: return 0;
+	case SETTINGS_HW_JOYSTICK_RGB: return 1;
+	case SETTINGS_HW_USB_DEBUG: return 2;
+	case SETTINGS_HW_VOLUME: return 3;
+	default: return -1;
 	}
 }
 
@@ -315,20 +464,33 @@ static int settings_worker_main(void *context)
 			break;
 		}
 		request = worker->requests[worker->request_head];
+		secure_clear(&worker->requests[worker->request_head],
+			sizeof(worker->requests[worker->request_head]));
 		worker->request_head =
 			(worker->request_head + 1U) % SETTINGS_WORK_QUEUE;
 		--worker->request_count;
+		worker->active_request = request;
+		worker->request_active = true;
 		(void)SDL_UnlockMutex(worker->mutex);
 		result = execute_request(worker, &request);
+		secure_clear(request.secret, sizeof(request.secret));
+		(void)SDL_LockMutex(worker->mutex);
+		worker->request_active = false;
+		secure_clear(&worker->active_request,
+			sizeof(worker->active_request));
+		{
+			int state_index = coalesced_state_index(request.command);
+
+			if (state_index >= 0 && result.spawn_error == 0 &&
+			    result.exit_code == 0 && result.term_signal == 0) {
+				worker->last_applied_value[state_index] = request.value;
+				worker->last_applied_valid[state_index] = true;
+			}
+		}
+		(void)SDL_UnlockMutex(worker->mutex);
 		store_result(worker, &result);
 	}
 	return 0;
-}
-
-static bool coalesces_pending_request(enum settings_hardware_command command)
-{
-	return command == SETTINGS_HW_JOYSTICK_RGB ||
-		command == SETTINGS_HW_USB_DEBUG;
 }
 
 static void remove_pending_requests(struct settings_worker *worker,
@@ -359,7 +521,30 @@ static int enqueue_hardware(struct settings_state *settings,
 {
 	struct settings_worker *worker = settings->worker;
 	size_t position;
+	int state_index = coalesced_state_index(command);
+	int previous_value = -1;
 	int error = 0;
+	uint64_t request_id;
+	bool cached_result = false;
+
+	settings->last_request_id = 0U;
+
+	switch (command) {
+	case SETTINGS_HW_BRIGHTNESS:
+		previous_value = settings->preferences.backlight_percent;
+		break;
+	case SETTINGS_HW_JOYSTICK_RGB:
+		previous_value = settings->preferences.joystick_rgb_brightness;
+		break;
+	case SETTINGS_HW_USB_DEBUG:
+		previous_value = settings->preferences.usb_debug_enabled ? 1 : 0;
+		break;
+	case SETTINGS_HW_VOLUME:
+		previous_value = settings->volume_target;
+		break;
+	default:
+		break;
+	}
 
 	if (worker == NULL)
 		return ENODEV;
@@ -368,27 +553,167 @@ static int enqueue_hardware(struct settings_state *settings,
 		error = ESHUTDOWN;
 	else {
 		/*
-		 * RGB and USB debug are last-value state.  Drop their older pending
-		 * values, then append the newest request so its ordering relative to
-		 * mute, shutdown, and other commands remains FIFO-correct.
+		 * Brightness, RGB, USB debug and volume are last-value state.  Keep at
+		 * most the request that is executing plus the newest pending value.
+		 * Edge-triggered commands (mute and shutdown) remain strict FIFO.
 		 */
-		if (coalesces_pending_request(command))
+		if (state_index >= 0) {
 			remove_pending_requests(worker, command);
+			/*
+			 * Do not duplicate an identical command that is still running; its
+			 * result carries the same request id.  For a value already confirmed
+			 * by this worker, publish a synthetic completion so the UI remains
+			 * result-driven without spawning another helper.
+			 */
+			if (worker->request_count == 0U && worker->request_active &&
+			    worker->active_request.command == command &&
+			    worker->active_request.value == value) {
+				settings->last_request_id =
+					worker->active_request.request_id;
+				(void)SDL_UnlockMutex(worker->mutex);
+				return 0;
+			}
+			if (worker->request_count == 0U && !worker->request_active &&
+			    worker->last_applied_valid[state_index] &&
+			    worker->last_applied_value[state_index] == value) {
+				struct settings_hardware_result cached = {
+					.command = command,
+					.value = value,
+					.previous_value = previous_value,
+					.exit_code = 0,
+				};
+
+				request_id = ++settings->next_request_id;
+				if (request_id == 0U)
+					request_id = ++settings->next_request_id;
+				cached.request_id = request_id;
+				settings->last_request_id = request_id;
+				store_result_locked(worker, &cached);
+				cached_result = true;
+				goto unlock;
+			}
+		}
 		if (worker->request_count == SETTINGS_WORK_QUEUE)
 			error = EAGAIN;
 		else {
+			request_id = ++settings->next_request_id;
+			if (request_id == 0U)
+				request_id = ++settings->next_request_id;
 			position = (worker->request_head + worker->request_count) %
 				SETTINGS_WORK_QUEUE;
 			worker->requests[position] = (struct settings_request) {
 				.command = command,
+				.request_id = request_id,
 				.value = value,
+				.previous_value = previous_value,
 			};
 			++worker->request_count;
+			settings->last_request_id = request_id;
 			(void)SDL_CondSignal(worker->condition);
 		}
 	}
+unlock:
+	(void)SDL_UnlockMutex(worker->mutex);
+	if (cached_result)
+		notify_result();
+	return error;
+}
+
+static int enqueue_network(struct settings_state *settings,
+			   enum settings_hardware_command command, int value,
+			   const char *identifier, const char *secret)
+{
+	struct settings_worker *worker = settings->worker;
+	size_t position;
+	uint64_t request_id;
+	int error = 0;
+
+	settings->last_request_id = 0U;
+	if (worker == NULL)
+		return ENODEV;
+	if (identifier != NULL && strlen(identifier) >=
+	    sizeof(worker->requests[0].identifier))
+		return EINVAL;
+	if (secret != NULL && strlen(secret) >= sizeof(worker->requests[0].secret))
+		return EINVAL;
+	(void)SDL_LockMutex(worker->mutex);
+	if (worker->stopping)
+		error = ESHUTDOWN;
+	else if (worker->request_count == SETTINGS_WORK_QUEUE)
+		error = EAGAIN;
+	else {
+		request_id = ++settings->next_request_id;
+		if (request_id == 0U)
+			request_id = ++settings->next_request_id;
+		position = (worker->request_head + worker->request_count) %
+			SETTINGS_WORK_QUEUE;
+		worker->requests[position] = (struct settings_request) {
+			.command = command,
+			.request_id = request_id,
+			.value = value,
+			.previous_value = -1,
+		};
+		if (identifier != NULL)
+			(void)snprintf(worker->requests[position].identifier,
+				sizeof(worker->requests[position].identifier), "%s",
+				identifier);
+		if (secret != NULL)
+			(void)snprintf(worker->requests[position].secret,
+				sizeof(worker->requests[position].secret), "%s", secret);
+		++worker->request_count;
+		settings->last_request_id = request_id;
+		(void)SDL_CondSignal(worker->condition);
+	}
 	(void)SDL_UnlockMutex(worker->mutex);
 	return error;
+}
+
+static bool valid_bssid(const char *value)
+{
+	if (value == NULL || strlen(value) != 17U)
+		return false;
+	for (size_t i = 0U; i < 17U; ++i) {
+		if (i % 3U == 2U) {
+			if (value[i] != ':')
+				return false;
+		} else if (!((value[i] >= '0' && value[i] <= '9') ||
+			     (value[i] >= 'A' && value[i] <= 'F'))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool valid_uuid(const char *value)
+{
+	static const size_t hyphens[] = { 8U, 13U, 18U, 23U };
+
+	if (value == NULL || strlen(value) != 36U)
+		return false;
+	for (size_t i = 0U; i < 36U; ++i) {
+		bool hyphen = false;
+
+		for (size_t j = 0U; j < sizeof(hyphens) / sizeof(hyphens[0]); ++j)
+			hyphen = hyphen || i == hyphens[j];
+		if ((hyphen && value[i] != '-') || (!hyphen &&
+		    !((value[i] >= '0' && value[i] <= '9') ||
+		      (value[i] >= 'a' && value[i] <= 'f'))))
+			return false;
+	}
+	return value[14] >= '1' && value[14] <= '5' &&
+		strchr("89ab", value[19]) != NULL;
+}
+
+static bool valid_password(const char *password)
+{
+	if (password == NULL || strlen(password) > 63U)
+		return false;
+	for (const unsigned char *cursor = (const unsigned char *)password;
+	     *cursor != '\0'; ++cursor) {
+		if (*cursor < 0x20U || *cursor > 0x7eU)
+			return false;
+	}
+	return true;
 }
 
 static int apply_backlight(void *context, int percent, bool screen_off)
@@ -449,11 +774,21 @@ void settings_init(struct settings_state *settings)
 {
 	memset(settings, 0, sizeof(*settings));
 	settings->preferences.backlight_percent = -1;
+	settings->preferences.auto_screen_off_minutes = 0;
 	settings->preferences.joystick_rgb_brightness = -1;
 	settings->preferences.usb_debug_enabled = true;
 	settings->preferences.screen_lock_enabled = true;
+	settings->preferences.boot_target_custom = true;
 	settings->usb_debug_available = -1;
 	settings->volume_target = -1;
+	for (int i = 0; i < SETTINGS_PENDING_COUNT; ++i) {
+		settings->pending[i].value = -1;
+		settings->pending[i].nav_index = -1;
+	}
+	settings->mute_pending.value = -1;
+	settings->mute_pending.nav_index = -1;
+	settings->reboot_pending.value = -1;
+	settings->reboot_pending.nav_index = -1;
 	for (int i = 0; i < DEBUG_LOG_CATEGORY_COUNT; ++i)
 		settings->log_sizes[i] = -1;
 }
@@ -526,6 +861,7 @@ void settings_backend_stop(struct settings_state *settings)
 	SDL_WaitThread(worker->thread, NULL);
 	SDL_DestroyCond(worker->condition);
 	SDL_DestroyMutex(worker->mutex);
+	secure_clear(worker, sizeof(*worker));
 	free(worker);
 	settings->worker = NULL;
 	settings->usb_debug_available = 0;
@@ -553,6 +889,62 @@ int settings_backend_poll(struct settings_state *settings,
 bool settings_backend_available(const struct settings_state *settings)
 {
 	return settings->worker != NULL;
+}
+
+int settings_request_network_status(struct settings_state *settings)
+{
+	return enqueue_network(settings, SETTINGS_HW_NETWORK_STATUS, 0, NULL, NULL);
+}
+
+int settings_request_wifi_recover(struct settings_state *settings)
+{
+	return enqueue_network(settings, SETTINGS_HW_WIFI_RECOVER, 0, NULL, NULL);
+}
+
+int settings_request_wifi_scan(struct settings_state *settings)
+{
+	return enqueue_network(settings, SETTINGS_HW_WIFI_SCAN, 0, NULL, NULL);
+}
+
+int settings_request_wifi_connect(struct settings_state *settings,
+				  const char *bssid, const char *password)
+{
+	char normalized[18];
+
+	if (bssid == NULL || strlen(bssid) != sizeof(normalized) - 1U ||
+	    !valid_password(password))
+		return EINVAL;
+	for (size_t i = 0U; i < sizeof(normalized) - 1U; ++i) {
+		unsigned char value = (unsigned char)bssid[i];
+
+		normalized[i] = value >= 'a' && value <= 'f' ?
+			(char)(value - 'a' + 'A') : (char)value;
+	}
+	normalized[sizeof(normalized) - 1U] = '\0';
+	if (!valid_bssid(normalized))
+		return EINVAL;
+	return enqueue_network(settings, SETTINGS_HW_WIFI_CONNECT, 0,
+		normalized, password);
+}
+
+int settings_request_wifi_disconnect(struct settings_state *settings)
+{
+	return enqueue_network(settings, SETTINGS_HW_WIFI_DISCONNECT, 0,
+		NULL, NULL);
+}
+
+int settings_request_wifi_forget(struct settings_state *settings,
+				 const char *uuid)
+{
+	if (!valid_uuid(uuid))
+		return EINVAL;
+	return enqueue_network(settings, SETTINGS_HW_WIFI_FORGET, 0, uuid, NULL);
+}
+
+int settings_request_hotspot_set(struct settings_state *settings, bool enabled)
+{
+	return enqueue_network(settings, SETTINGS_HW_HOTSPOT_SET,
+		enabled ? 1 : 0, NULL, NULL);
 }
 
 static bool valid_category(enum debug_log_category category)

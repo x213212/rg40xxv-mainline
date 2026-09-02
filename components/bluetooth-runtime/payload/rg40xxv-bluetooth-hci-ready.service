@@ -1,0 +1,17 @@
+[Unit]
+Description=Load RTL8821CS Bluetooth firmware and validate hci0
+After=local-fs.target systemd-udevd.service
+Before=bluetooth.service
+ConditionPathExists=/sys/bus/serial/drivers/hci_uart_h5
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/rg40xxv/rg40xxv-bluetooth-hci-ready
+RemainAfterExit=yes
+TimeoutStartSec=12s
+RuntimeDirectory=rg40xxv/bluetooth
+RuntimeDirectoryMode=0700
+NoNewPrivileges=no
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/sys/bus/serial/drivers/hci_uart_h5 /run/rg40xxv/bluetooth

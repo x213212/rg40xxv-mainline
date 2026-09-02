@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "ui.h"
+#include "cover_limits.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,35 +46,55 @@ static void create_large_bmp(const char *path)
 	SDL_FreeSurface(surface);
 }
 
-static bool worker_is_loading(struct ui *ui)
+static bool worker_has_started(struct ui *ui)
 {
-	bool loading = false;
+	bool started = false;
 
 	(void)SDL_LockMutex(ui->cover_worker.mutex);
 	for (size_t i = 0; i < COVER_CACHE_MAX; ++i) {
-		if (ui->cover_worker.jobs[i].loading) {
-			loading = true;
+		if (ui->cover_worker.jobs[i].loading ||
+		    ui->cover_worker.jobs[i].ready) {
+			started = true;
 			break;
 		}
 	}
+	if (ui->cover_worker.decoded_count > 0U)
+		started = true;
 	(void)SDL_UnlockMutex(ui->cover_worker.mutex);
-	return loading;
+	return started;
 }
 
 static void wait_until_worker_loading(struct ui *ui)
 {
 	for (unsigned int attempt = 0; attempt < 500; ++attempt) {
-		if (worker_is_loading(ui))
+		if (worker_has_started(ui))
 			return;
 		SDL_Delay(1U);
 	}
 	CHECK(false);
 }
 
+static void settle_visible_textures(struct ui *ui)
+{
+	ui->metrics.input_counter = 0U;
+	for (unsigned int attempt = 0; attempt < 3000; ++attempt) {
+		if (cover_cache_visible_settled(ui))
+			break;
+		SDL_Delay(1U);
+	}
+	CHECK(cover_cache_visible_settled(ui));
+	CHECK(cover_cache_texture_count(ui) == COVER_CACHE_MAX);
+	CHECK(cover_cache_texture_bytes(ui) > 0U);
+	CHECK(cover_cache_texture_bytes(ui) <= COVER_THUMBNAIL_CACHE_MAX_BYTES);
+}
+
 static void exercise_worker_lifecycle(struct ui *ui)
 {
 	size_t total_stale = 0;
 	size_t total_cancelled = 0;
+	size_t total_disk_hits = 0;
+	size_t total_disk_misses = 0;
+	size_t total_disk_writes = 0;
 
 	for (size_t lifecycle = 0; lifecycle < LIFECYCLE_COUNT; ++lifecycle) {
 		CHECK(cover_cache_init(ui) == 0);
@@ -91,7 +112,12 @@ static void exercise_worker_lifecycle(struct ui *ui)
 		}
 		total_stale += cover_cache_stale_dropped_count(ui);
 		total_cancelled += cover_cache_queued_cancelled_count(ui);
+		SDL_Delay(20U);
+		total_disk_hits += cover_cache_disk_hit_count(ui);
+		total_disk_misses += cover_cache_disk_miss_count(ui);
+		total_disk_writes += cover_cache_disk_write_count(ui);
 		CHECK(cover_cache_visible_eviction_count(ui) == 0);
+		settle_visible_textures(ui);
 
 		/* This intentionally joins a worker that may still be decoding. */
 		cover_cache_destroy(ui);
@@ -99,11 +125,24 @@ static void exercise_worker_lifecycle(struct ui *ui)
 		CHECK(ui->cover_worker.mutex == NULL);
 		CHECK(ui->cover_worker.condition == NULL);
 		CHECK(cover_cache_texture_count(ui) == 0);
+		CHECK(cover_cache_texture_bytes(ui) == 0U);
+		CHECK(cover_cache_texture_create_count(ui) ==
+		      cover_cache_texture_destroy_count(ui));
 	}
 	CHECK(total_stale > 0);
 	CHECK(total_cancelled > 0);
-	(void)printf("COVER_WORKER_LIFECYCLE_TEST PASS checks=%u cycles=%u stale=%zu cancelled=%zu\n",
-		     checks, LIFECYCLE_COUNT, total_stale, total_cancelled);
+	if (ui->cover_cache_dir[0] != '\0') {
+		CHECK(total_disk_hits > 0);
+		CHECK(total_disk_misses > 0);
+		CHECK(total_disk_writes > 0);
+	}
+	(void)printf("COVER_WORKER_LIFECYCLE_TEST PASS checks=%u cycles=%u stale=%zu cancelled=%zu disk_hits=%zu disk_misses=%zu disk_writes=%zu texture_create=%zu texture_destroy=%zu texture_peak_bytes=%llu peak_rss_kib=%llu\n",
+		     checks, LIFECYCLE_COUNT, total_stale, total_cancelled,
+		     total_disk_hits, total_disk_misses, total_disk_writes,
+		     cover_cache_texture_create_count(ui),
+		     cover_cache_texture_destroy_count(ui),
+		     (unsigned long long)cover_cache_texture_peak_bytes(ui),
+		     (unsigned long long)cover_cache_peak_rss_kib());
 }
 
 int main(int argc, char **argv)
@@ -116,11 +155,16 @@ int main(int argc, char **argv)
 	bool remove_fixture;
 	int fd = -1;
 
-	CHECK(argc == 1 || argc == 2);
+	CHECK(argc >= 1 && argc <= 3);
 	memset(&ui, 0, sizeof(ui));
 	memset(games, 0, sizeof(games));
-	CHECK(SDL_Init(SDL_INIT_TIMER) == 0);
-	if (argc == 2) {
+	CHECK(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_TIMER) == 0);
+	ui.window = SDL_CreateWindow("cover-worker-test", 0, 0, 640, 480,
+		SDL_WINDOW_HIDDEN);
+	CHECK(ui.window != NULL);
+	ui.renderer = SDL_CreateRenderer(ui.window, -1, SDL_RENDERER_SOFTWARE);
+	CHECK(ui.renderer != NULL);
+	if (argc >= 2) {
 		fixture_path = argv[1];
 		remove_fixture = false;
 	} else {
@@ -131,6 +175,8 @@ int main(int argc, char **argv)
 		remove_fixture = true;
 	}
 	create_large_bmp(fixture_path);
+	if (argc == 3)
+		CHECK(cover_cache_configure(&ui, argv[2]) == 0);
 
 	for (size_t i = 0; i < GAME_COUNT; ++i) {
 		visible[i] = i;
@@ -145,6 +191,8 @@ int main(int argc, char **argv)
 
 	if (remove_fixture)
 		CHECK(unlink(fixture_path) == 0);
+	SDL_DestroyRenderer(ui.renderer);
+	SDL_DestroyWindow(ui.window);
 	SDL_Quit();
 	return 0;
 }

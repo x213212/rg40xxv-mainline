@@ -75,14 +75,14 @@ MOCK_NMCLI=$MOCK_BIN/nmcli
 	printf '    [[ ! -e "$root/run/known-deleted" ]] && printf "%%s:802-11-wireless\\n" "$known"\n'
 	printf '    [[ $state == fresh || -e "$root/run/fresh-profile" ]] && printf "%%s:802-11-wireless\\n" "$fresh"\n'
 	printf '    exit 0 ;;\n'
+	printf '  "--get-values connection.id connection show uuid $fresh") printf "rg40xxv-wifi-112233445566\\n"; exit 0 ;;\n'
+	printf '  "--get-values connection.id connection show uuid $known") printf "home-profile\\n"; exit 0 ;;\n'
 	printf '  "--get-values 802-11-wireless.mode connection show uuid "*)\n'
 	printf '    [[ ${*: -1} == "$fresh" || ${*: -1} == "$known" ]] && printf "infrastructure\\n" || printf "ap\\n"\n'
 	printf '    exit 0 ;;\n'
 	printf '  "--get-values 802-11-wireless.ssid connection show uuid "*)\n'
 	printf '    case ${*: -1} in "$known") printf "Home:WiFi\\n" ;; "$fresh") printf "Cafe Net\\n" ;; *) printf "RG40XXV-Hotspot\\n" ;; esac\n'
 	printf '    exit 0 ;;\n'
-	printf '  "--get-values connection.id connection show uuid $fresh") printf "rg40xxv-wifi-112233445566\\n"; exit 0 ;;\n'
-	printf '  "--get-values connection.id connection show uuid $known") printf "home-profile\\n"; exit 0 ;;\n'
 	printf '  "--get-values connection.type connection show uuid "*) printf "802-11-wireless\\n"; exit 0 ;;\n'
 	printf '  "--get-values GENERAL.CON-UUID device show wlan0")\n'
 	printf '    case $state in connected) printf "%%s\\n" "$known" ;; fresh) printf "%%s\\n" "$fresh" ;; hotspot) printf "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\\n" ;; esac\n'
@@ -159,7 +159,7 @@ grep -Fxq 'unmask NetworkManager.service' "$ROOTFS/run/systemctl.argv"
 grep -Fxq 'enable NetworkManager.service' "$ROOTFS/run/systemctl.argv"
 grep -Fxq 'start NetworkManager.service' "$ROOTFS/run/systemctl.argv"
 grep -Fxq 'unblock wifi' "$ROOTFS/run/rfkill.argv"
-grep -Fq '802-11-wireless.powersave 2 connection.autoconnect yes connection.autoconnect-retries 0' "$ROOTFS/run/nmcli.argv"
+grep -Fq '802-11-wireless.powersave 2 connection.autoconnect yes connection.autoconnect-retries 0 ipv6.method disabled' "$ROOTFS/run/nmcli.argv"
 grep -Fq -- '--rescan no' "$ROOTFS/run/nmcli.argv"
 [[ ! -e $ROOTFS/run/wifi-sdio.argv ]]
 
@@ -208,6 +208,8 @@ printf '%s\n' fixture-network-secret | \
 	"$CTL" connect 11:22:33:44:55:66 >"$FIXTURE/connect.snapshot"
 [[ $(<"$ROOTFS/run/nmcli.secret") == secret-bytes=22 ]]
 ! grep -Fq fixture-network-secret "$ROOTFS/run/nmcli.argv"
+grep -Fq 'connection modify uuid 123e4567-e89b-42d3-a456-426614174000 802-11-wireless.powersave 2 connection.autoconnect yes connection.autoconnect-retries 0 ipv6.method disabled' \
+	"$ROOTFS/run/nmcli.argv"
 grep -Eq $'^S\t1\t1\t1\t0\t123e4567-e89b-42d3-a456-426614174000\t11:22:33:44:55:66\tCafe%20Net\t192.168.0.125%2F24\t-$' "$FIXTURE/connect.snapshot"
 
 "$CTL" disconnect >/dev/null

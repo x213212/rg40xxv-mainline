@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int write_all(int fd, const char *payload)
@@ -49,9 +50,46 @@ static void sync_parent(const char *path)
 	}
 }
 
+static bool payload_matches_file(const char *path, const char *payload,
+				 size_t payload_length)
+{
+	char buffer[4096];
+	struct stat metadata;
+	size_t offset = 0U;
+	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	bool matches = false;
+
+	if (fd < 0)
+		return false;
+	if (fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+	    metadata.st_uid != geteuid() || metadata.st_nlink != 1 ||
+	    metadata.st_size < 0 || (uint64_t)metadata.st_size != payload_length)
+		goto out;
+	while (offset < payload_length) {
+		size_t requested = payload_length - offset;
+		ssize_t count;
+
+		if (requested > sizeof(buffer))
+			requested = sizeof(buffer);
+		do {
+			count = read(fd, buffer, requested);
+		} while (count < 0 && errno == EINTR);
+		if (count <= 0 ||
+		    memcmp(buffer, payload + offset, (size_t)count) != 0)
+			goto out;
+		offset += (size_t)count;
+	}
+	matches = true;
+
+out:
+	(void)close(fd);
+	return matches;
+}
+
 static int atomic_write(const char *path, const char *payload)
 {
 	char temporary[PATH_MAX];
+	size_t payload_length = strlen(payload);
 	int fd;
 	int length;
 	int result = -1;
@@ -59,6 +97,9 @@ static int atomic_write(const char *path, const char *payload)
 	length = snprintf(temporary, sizeof(temporary), "%s.tmp", path);
 	if (path[0] == '\0' || length < 0 || (size_t)length >= sizeof(temporary))
 		return -1;
+	/* Avoid an fsync+rename cycle when the durable bytes already match. */
+	if (payload_matches_file(path, payload, payload_length))
+		return 0;
 	fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
 	if (fd < 0)
 		return -1;
@@ -217,21 +258,21 @@ void persistence_request_filters(struct ui *ui)
 		return;
 	(void)snprintf(payload, size,
 		"system=%s\ncore=%s\nfavorites=%d\nrecent=%d\nsearch_scope=%s\n",
-		system, core, catalog->favorites_only ? 1 : 0,
-		catalog->recent_only ? 1 : 0,
+		system, core, 0, 0,
 		catalog->search_all_systems ? "all" : "current");
 	queue_payload(ui, PERSISTENCE_FILTERS, catalog->filter_state_path, payload);
 }
 
 void persistence_request_locale(struct ui *ui)
 {
-	char *payload = malloc(160U);
+	char *payload = malloc(224U);
 
 	if (payload != NULL)
-		(void)snprintf(payload, 160U,
-			"language=%s\nscreen_lock=%d\nbrightness=%d\njoystick_rgb=%d\nusb_debug=%d\n",
+		(void)snprintf(payload, 224U,
+			"language=%s\nscreen_lock=%d\nauto_screen_off=%d\nbrightness=%d\njoystick_rgb=%d\nusb_debug=%d\nboot_target=custom\n",
 			ui->locale.language == UI_LANGUAGE_ZH_TW ? "zh_TW" : "en",
 			ui->settings.preferences.screen_lock_enabled ? 1 : 0,
+			ui->settings.preferences.auto_screen_off_minutes,
 			ui->settings.preferences.backlight_percent,
 			ui->settings.preferences.joystick_rgb_brightness,
 			ui->settings.preferences.usb_debug_enabled ? 1 : 0);

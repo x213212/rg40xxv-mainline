@@ -1,0 +1,30 @@
+#!/bin/bash
+set -uo pipefail
+
+readonly component=${RG_YOUTUBE_COMPONENT_ROOT:-/usr/local/rg40xxv-youtube-mvp}
+readonly ui_service=rg40xxv-ui.service
+
+restore_ui()
+{
+	systemctl start "$ui_service" >/dev/null 2>&1 || true
+}
+
+trap restore_ui EXIT HUP INT TERM
+systemctl stop "$ui_service" || exit 71
+
+export RG_YOUTUBE_COMPONENT_ROOT=$component
+export RG_YOUTUBE_SESSION=$component/bin/rg40xxv-youtube-native-session
+export RG_YOUTUBE_RUNTIME_ROOT=/run/rg40xxv-youtube-native
+export RG_YOUTUBE_DRM_DEVICE=/dev/dri/card1
+export RG_YOUTUBE_DRM_CONNECTOR=DSI-1
+export SDL_VIDEODRIVER=kmsdrm
+export SDL_KMSDRM_REQUIRE_DRM_MASTER=1
+export SDL_GAMECONTROLLERCONFIG_FILE=/opt/rg40xxv/share/gamecontrollerdb.txt
+export MESA_SHADER_CACHE_DIR=/mnt/data/rg40xxv/state/mesa-shader-cache
+export MESA_SHADER_CACHE_MAX_SIZE=64M
+export LIBGL_DRIVERS_PATH=/opt/rg40xxv/mesa/lib/dri
+export LD_LIBRARY_PATH=/opt/rg40xxv/sdl/lib:/opt/rg40xxv/mesa/lib:/opt/glibc-2.38/lib:/opt/glibc-2.38/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/usr/lib
+
+setsid /opt/rg40xxv/bin/rg40xxv-game-session -- \
+	/opt/rg40xxv/bin/rg40xxv-exit-chord --grace-ms 1500 -- \
+	"$component/bin/rg40xxv-youtube-native"

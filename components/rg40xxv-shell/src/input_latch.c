@@ -95,6 +95,24 @@ void input_latch_force_ready(struct input_latch *latch)
 	latch->waiting = false;
 }
 
+void input_activation_guard_init(struct input_activation_guard *guard)
+{
+	guard->armed = true;
+}
+
+void input_activation_guard_release(struct input_activation_guard *guard)
+{
+	guard->armed = true;
+}
+
+bool input_activation_guard_consume(struct input_activation_guard *guard)
+{
+	if (!guard->armed)
+		return false;
+	guard->armed = false;
+	return true;
+}
+
 int input_latch_evdev_button_index(enum input_latch_evdev_profile profile,
 				   unsigned int code)
 {

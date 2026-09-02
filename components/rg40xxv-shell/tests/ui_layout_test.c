@@ -13,7 +13,7 @@ static void test_horizontal_navigation_and_content(void)
 {
 	struct ui_layout_rect previous = { 0 };
 
-	assert(UI_LAYOUT_NAV_COUNT == 7);
+	assert(UI_LAYOUT_NAV_COUNT == 8);
 	assert(UI_LAYOUT_NAV_Y >= UI_LAYOUT_STATUS_BOTTOM);
 	assert(UI_LAYOUT_NAV_X == UI_LAYOUT_CONTENT_X);
 	assert(UI_LAYOUT_NAV_WIDTH == UI_LAYOUT_CONTENT_WIDTH);
@@ -24,7 +24,7 @@ static void test_horizontal_navigation_and_content(void)
 	for (int index = 0; index < UI_LAYOUT_NAV_COUNT; ++index) {
 		struct ui_layout_rect tab = ui_layout_navigation_tab(index);
 
-		assert(tab.width >= 86);
+		assert(tab.width >= 76);
 		assert(tab.y >= UI_LAYOUT_NAV_Y);
 		assert(tab.y + tab.height <=
 			UI_LAYOUT_NAV_Y + UI_LAYOUT_NAV_HEIGHT);
@@ -99,6 +99,6 @@ int main(void)
 	test_horizontal_navigation_and_content();
 	test_cover_wall();
 	test_marquee();
-	puts("UI_LAYOUT_TEST PASS tabs=7 covers=5 selected=160x232 marquee-pause=800ms");
+	puts("UI_LAYOUT_TEST PASS tabs=8 covers=5 selected=160x232 marquee-pause=800ms");
 	return 0;
 }

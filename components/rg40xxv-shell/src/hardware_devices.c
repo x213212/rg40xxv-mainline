@@ -99,17 +99,31 @@ void hw_refresh_wifi(const struct hardware_backend *backend,
 		wifi->operstate = HARDWARE_NETWORK_UNKNOWN;
 }
 
-static int find_typed_device(const char *root, const char *wanted,
+static int find_typed_device(struct hardware_backend *backend,
+			     enum hw_discovery_slot slot, const char *root,
+			     const char *wanted,
 			     char *name, size_t size)
 {
 	char path[PATH_MAX];
 	char type[64];
 	struct dirent *entry;
-	DIR *directory = hw_open_directory(root);
+	DIR *directory;
 	unsigned int seen = 0;
 
-	if (directory == NULL)
+	if (hw_discovery_cached_device(backend, slot, root, name, size, NULL, 0) == 0) {
+		if (hw_device_path(path, sizeof(path), root, name, "type") == 0 &&
+		    hw_read_text(path, type, sizeof(type)) == 0 &&
+		    strcmp(type, wanted) == 0)
+			return 0;
+		hw_discovery_forget(backend, slot);
+	}
+	if (!hw_discovery_should_scan(backend, slot))
 		return -1;
+	directory = hw_discovery_open_directory(backend, root);
+	if (directory == NULL) {
+		hw_discovery_mark_missing(backend, slot);
+		return -1;
+	}
 	while (seen++ < HW_DIRECTORY_ENTRY_MAX &&
 	       (entry = readdir(directory)) != NULL) {
 		if (!hw_valid_component(entry->d_name) ||
@@ -117,15 +131,19 @@ static int find_typed_device(const char *root, const char *wanted,
 		    hw_read_text(path, type, sizeof(type)) != 0 ||
 		    strcmp(type, wanted) != 0)
 			continue;
-		(void)snprintf(name, size, "%.63s", entry->d_name);
-		(void)closedir(directory);
-		return 0;
+		if (hw_discovery_remember(backend, slot, root, entry->d_name,
+					  "type") == 0) {
+			(void)snprintf(name, size, "%.63s", entry->d_name);
+			(void)closedir(directory);
+			return 0;
+		}
 	}
 	(void)closedir(directory);
+	hw_discovery_mark_missing(backend, slot);
 	return -1;
 }
 
-void hw_refresh_battery(const struct hardware_backend *backend,
+void hw_refresh_battery(struct hardware_backend *backend,
 			struct hardware_battery *battery)
 {
 	char root[PATH_MAX];
@@ -134,7 +152,8 @@ void hw_refresh_battery(const struct hardware_backend *backend,
 	int64_t value;
 
 	if (hw_path(root, sizeof(root), backend, "/sys/class/power_supply") != 0 ||
-	    find_typed_device(root, "Battery", battery->device,
+	    find_typed_device(backend, HW_DISCOVERY_BATTERY, root, "Battery",
+			      battery->device,
 			      sizeof(battery->device)) != 0)
 		return;
 	value = hw_device_number(root, battery->device, "capacity", 0, 100);
@@ -155,27 +174,40 @@ void hw_refresh_battery(const struct hardware_backend *backend,
 		battery->status = HARDWARE_BATTERY_UNKNOWN;
 }
 
-static int first_entry(const char *root, char *name, size_t size)
+static int first_entry(struct hardware_backend *backend,
+		       enum hw_discovery_slot slot, const char *root,
+		       const char *leaf,
+		       char *name, size_t size)
 {
 	struct dirent *entry;
-	DIR *directory = hw_open_directory(root);
+	DIR *directory;
 	unsigned int seen = 0;
 
-	if (directory == NULL)
+	if (hw_discovery_cached_device(backend, slot, root, name, size, NULL, 0) == 0)
+		return 0;
+	if (!hw_discovery_should_scan(backend, slot))
 		return -1;
+	directory = hw_discovery_open_directory(backend, root);
+	if (directory == NULL) {
+		hw_discovery_mark_missing(backend, slot);
+		return -1;
+	}
 	while (seen++ < HW_DIRECTORY_ENTRY_MAX &&
 	       (entry = readdir(directory)) != NULL) {
 		if (!hw_valid_component(entry->d_name))
 			continue;
-		(void)snprintf(name, size, "%.63s", entry->d_name);
-		(void)closedir(directory);
-		return 0;
+		if (hw_discovery_remember(backend, slot, root, entry->d_name, leaf) == 0) {
+			(void)snprintf(name, size, "%.63s", entry->d_name);
+			(void)closedir(directory);
+			return 0;
+		}
 	}
 	(void)closedir(directory);
+	hw_discovery_mark_missing(backend, slot);
 	return -1;
 }
 
-void hw_refresh_backlight(const struct hardware_backend *backend,
+void hw_refresh_backlight(struct hardware_backend *backend,
 			  struct hardware_backlight *light)
 {
 	char root[PATH_MAX];
@@ -186,7 +218,9 @@ void hw_refresh_backlight(const struct hardware_backend *backend,
 	int64_t power;
 
 	if (hw_path(root, sizeof(root), backend, "/sys/class/backlight") != 0 ||
-	    first_entry(root, light->device, sizeof(light->device)) != 0)
+	    first_entry(backend, HW_DISCOVERY_BACKLIGHT, root, "max_brightness",
+			light->device,
+			sizeof(light->device)) != 0)
 		return;
 	maximum = hw_device_number(root, light->device, "max_brightness", 1,
 				   INT_MAX);
